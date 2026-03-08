@@ -995,6 +995,8 @@ async def start_app_process(
     log_path = os.path.join(project_dir, "deploy.log")
 
     try:
+        # Ensure the deploy directory exists (may be missing on restart)
+        os.makedirs(project_dir, exist_ok=True)
         log_file = open(log_path, "a")
         proc = subprocess.Popen(
             cmd,
@@ -1306,9 +1308,14 @@ async def run_deployment(
             "error_msg": str(e)[:2000],
             "finished_at": datetime.now(timezone.utc).isoformat(),
         })
-        await db_update_project(project_id, {"status": DeployState.FAILED})
+        # Clear deploy_dir in DB so restart doesn't reference a deleted path
+        await db_update_project(project_id, {
+            "status": DeployState.FAILED,
+            "deploy_dir": None,
+        })
 
-        # Cleanup on failure
+        # Cleanup on failure — only wipe the dir if process never started
+        # (if it started but crashed, keep logs for debugging)
         try:
             shutil.rmtree(deploy_dir, ignore_errors=True)
         except Exception:
@@ -1334,6 +1341,16 @@ async def restart_deployment(project_id: str, deployment_id: str) -> bool:
     env_vars = project.get("env_vars") or {}
 
     if not deploy_dir or not startup_cmd:
+        await db_update_deployment(deployment_id, {"status": DeployState.FAILED})
+        return False
+
+    # Guard: deploy dir must exist — it could have been wiped after a failed deploy
+    if not os.path.isdir(deploy_dir):
+        await db_add_log(deployment_id, project_id,
+            f"Deploy directory missing ({deploy_dir}). Re-deploy the project to fix this.",
+            level="error", source="runtime")
+        await db_update_deployment(deployment_id, {"status": DeployState.FAILED})
+        await db_update_project(project_id, {"status": DeployState.FAILED})
         return False
 
     port = allocate_port()
