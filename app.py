@@ -2736,17 +2736,51 @@ async def _proxy_request(
             if loc and loc.startswith("/") and not loc.startswith(f"/p/{project_id}"):
                 resp_headers["location"] = f"/p/{project_id}{loc}"
 
-        # ── HTML: inject <base> tag so relative hrefs/srcs resolve ───────
+        # ── HTML: rewrite absolute paths so they go through the proxy ──
+        # <base> tags only fix *relative* URLs; absolute paths like href="/about"
+        # bypass the proxy entirely.  We rewrite them in the HTML body directly.
         if project_id and "text/html" in content_type:
-            base_href = f"/p/{project_id}/"
-            base_tag = f'<base href="{base_href}">'.encode()
-            # Insert after <head> or <HEAD>, else prepend
-            for needle in (b"<head>", b"<HEAD>", b"<Head>"):
-                if needle in resp_body:
-                    resp_body = resp_body.replace(needle, needle + base_tag, 1)
-                    break
-            else:
-                resp_body = base_tag + resp_body
+            prefix = "/p/" + project_id
+            try:
+                html = resp_body.decode("utf-8", errors="replace")
+
+                def _skip(path: str) -> bool:
+                    # Don't rewrite already-proxied, protocol-relative, or scheme paths
+                    return (
+                        path.startswith("/p/" + project_id)
+                        or path.startswith("//")
+                        or (":" in path and path.index(":") < path.index("/") + 1)
+                    )
+
+                # ── Rewrite HTML attribute values: href, src, action etc. ──
+                ATTR_RE = re.compile(
+                    r'((?:href|src|action|data-src|data-url|data-href))'
+                    r'=([\'"])'
+                    r'(/[^\'">\s]*)'
+                    r'(\2)'
+                )
+                def rewrite_attr(m: re.Match) -> str:
+                    attr, q, path, q2 = m.group(1), m.group(2), m.group(3), m.group(4)
+                    if _skip(path):
+                        return m.group(0)
+                    return attr + "=" + q + prefix + path + q2
+
+                html = ATTR_RE.sub(rewrite_attr, html)
+
+                # ── Rewrite JS string literals that are absolute paths ────
+                # Catches fetch("/api"), axios.get("/path"), location.href = "/x"
+                JS_RE = re.compile(r'([\'"])(/[^\'"\s>]{1,500})\1')
+                def rewrite_js(m: re.Match) -> str:
+                    q, path = m.group(1), m.group(2)
+                    if _skip(path):
+                        return m.group(0)
+                    return q + prefix + path + q
+
+                html = JS_RE.sub(rewrite_js, html)
+
+                resp_body = html.encode("utf-8")
+            except Exception:
+                pass  # never crash the proxy over a rewrite failure
 
         return Response(
             content=resp_body,
