@@ -248,7 +248,33 @@ async def db_create_session(user_id: str) -> str:
     return token
 
 
+# ── In-memory session cache ────────────────────────────────────────────────
+# Stores {token: (session_dict, cached_at_timestamp)}
+# Entries are reused for SESSION_CACHE_TTL seconds before re-validating with
+# Supabase. On logout the entry is evicted immediately.
+_session_cache: Dict[str, tuple] = {}
+SESSION_CACHE_TTL: int = int(os.environ.get("SESSION_CACHE_TTL", "60"))  # seconds
+
+
+def _session_cache_evict_expired():
+    """Remove stale entries (called lazily on each cache access)."""
+    now = time.monotonic()
+    stale = [t for t, (_, cached_at) in _session_cache.items()
+             if now - cached_at > SESSION_CACHE_TTL]
+    for t in stale:
+        del _session_cache[t]
+
+
 async def db_get_session(token: str) -> Optional[Dict]:
+    # 1. Check in-memory cache first
+    _session_cache_evict_expired()
+    cached = _session_cache.get(token)
+    if cached is not None:
+        session_data, cached_at = cached
+        if time.monotonic() - cached_at <= SESSION_CACHE_TTL:
+            return session_data  # no Supabase call
+
+    # 2. Cache miss — hit Supabase
     sb = get_supabase_service()
     result = (
         sb.table("sessions")
@@ -258,10 +284,16 @@ async def db_get_session(token: str) -> Optional[Dict]:
         .limit(1)
         .execute()
     )
-    return result.data[0] if result.data else None
+    session_data = result.data[0] if result.data else None
+
+    # 3. Populate cache (even None, so we dont hammer Supabase for invalid tokens)
+    _session_cache[token] = (session_data, time.monotonic())
+    return session_data
 
 
 async def db_delete_session(token: str):
+    # Evict from cache immediately so logout takes effect right away
+    _session_cache.pop(token, None)
     sb = get_supabase_service()
     sb.table("sessions").delete().eq("token", token).execute()
 
