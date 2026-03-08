@@ -2206,6 +2206,9 @@ async def lifespan(app: FastAPI):
     # Ensure deploy directory exists
     os.makedirs(BASE_DEPLOY_DIR, exist_ok=True)
 
+    # Pre-seed the used-ports set so PyDeploy's own port is never handed out
+    _used_ports.add(PORT)
+
     # Try to init DB tables (silently fail if Supabase isn't configured yet)
     try:
         await db_init_tables()
@@ -2718,7 +2721,7 @@ async def _proxy_request(
             )
 
         # Forward response headers (skip hop-by-hop)
-        skip_resp = {"transfer-encoding", "connection", "keep-alive"}
+        skip_resp = {"transfer-encoding", "connection", "keep-alive", "content-length", "content-encoding"}
         resp_headers = {
             k: v for k, v in resp.headers.items()
             if k.lower() not in skip_resp
@@ -2802,6 +2805,14 @@ async def _proxy_app(request: Request, project_id: str, path: str):
         return HTMLResponse(
             content=_proxy_not_running_html(project_id, status),
             status_code=503 if status in ("failed", "stopped") else 202,
+        )
+
+    # Safety: never proxy to our own port (would cause an infinite loop)
+    if port == PORT:
+        logger.error(f"Project {project_id} has port={port} which is PyDeploy's own port. Re-deploy to fix.")
+        return HTMLResponse(
+            content=_proxy_not_running_html(project_id, "failed"),
+            status_code=503,
         )
 
     # ── Build target URL ──────────────────────────────────────────────
