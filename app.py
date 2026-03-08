@@ -945,9 +945,12 @@ _used_ports: set = set()
 
 
 def allocate_port() -> int:
-    """Allocate a free port for a new deployment."""
+    """Allocate a free port for a new deployment.
+    Skips PORT (the port PyDeploy itself is bound to) to avoid conflicts.
+    """
+    reserved = {PORT}  # never hand out our own listener port
     for port in range(BASE_APP_PORT, BASE_APP_PORT + 1000):
-        if port not in _used_ports:
+        if port not in _used_ports and port not in reserved:
             _used_ports.add(port)
             return port
     raise RuntimeError("No available ports for deployment.")
@@ -2678,10 +2681,12 @@ if (autoRefresh) {{
 async def _proxy_request(
     request: Request,
     target_url: str,
+    project_id: str = "",
 ) -> Response:
     """
     Forward an HTTP request to *target_url* and return the response.
-    Rewrites Location headers so redirects stay inside the /p/<id> prefix.
+    - Rewrites Location headers so redirects stay inside /p/<project_id>/
+    - Injects <base> tag into HTML so relative links resolve correctly
     """
     # Build forwarded headers (drop hop-by-hop)
     skip_headers = {
@@ -2709,7 +2714,7 @@ async def _proxy_request(
                 url=target_url,
                 headers=fwd_headers,
                 content=body,
-                params=dict(request.query_params),
+                # query string is already embedded in target_url
             )
 
         # Forward response headers (skip hop-by-hop)
@@ -2719,8 +2724,29 @@ async def _proxy_request(
             if k.lower() not in skip_resp
         }
 
+        content_type = resp.headers.get("content-type", "")
+        resp_body = resp.content
+
+        # ── Rewrite redirect Location to stay inside /p/<id>/ ────────────
+        if project_id and resp.status_code in (301, 302, 303, 307, 308):
+            loc = resp_headers.get("location", "")
+            if loc and loc.startswith("/") and not loc.startswith(f"/p/{project_id}"):
+                resp_headers["location"] = f"/p/{project_id}{loc}"
+
+        # ── HTML: inject <base> tag so relative hrefs/srcs resolve ───────
+        if project_id and "text/html" in content_type:
+            base_href = f"/p/{project_id}/"
+            base_tag = f'<base href="{base_href}">'.encode()
+            # Insert after <head> or <HEAD>, else prepend
+            for needle in (b"<head>", b"<HEAD>", b"<Head>"):
+                if needle in resp_body:
+                    resp_body = resp_body.replace(needle, needle + base_tag, 1)
+                    break
+            else:
+                resp_body = base_tag + resp_body
+
         return Response(
-            content=resp.content,
+            content=resp_body,
             status_code=resp.status_code,
             headers=resp_headers,
             media_type=resp.headers.get("content-type"),
@@ -2786,7 +2812,7 @@ async def _proxy_app(request: Request, project_id: str, path: str):
         target += f"?{qs}"
 
     # ── Proxy the request ─────────────────────────────────────────────
-    proxied = await _proxy_request(request, target)
+    proxied = await _proxy_request(request, target, project_id=project_id)
 
     if proxied is None:
         # Process crashed or not listening yet
