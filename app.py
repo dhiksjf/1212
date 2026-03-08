@@ -1632,6 +1632,7 @@ def render_dashboard_page(user: Dict, projects: List[Dict]) -> str:
               <div style="display: flex; gap: 8px;">
                 <a href="/project/{pid}" class="btn-secondary" style="text-decoration:none;padding:7px 14px;border-radius:6px;font-size:13px;">View</a>
                 <a href="/logs/{pid}" class="btn-secondary" style="text-decoration:none;padding:7px 14px;border-radius:6px;font-size:13px;">Logs</a>
+                <a href="/p/{pid}" target="_blank" rel="noopener" class="btn-secondary" style="text-decoration:none;padding:7px 14px;border-radius:6px;font-size:13px;color:var(--brand);border-color:#00ff8833;">Open ↗</a>
                 <button onclick="deleteProject('{pid}')" class="btn-danger" style="padding:7px 14px;border-radius:6px;font-size:13px;margin-left:auto;">Delete</button>
               </div>
             </div>""")
@@ -1941,6 +1942,18 @@ def render_project_page(user: Dict, project: Dict, deployments: List[Dict]) -> s
       </div>
     </div>
     
+    <div class="card" style="padding:20px 24px;margin-bottom:24px;display:flex;align-items:center;gap:16px;background:linear-gradient(135deg,#00ff8808,#00cfff08);border-color:#00ff8833;">
+      <div style="font-size:28px;">🌐</div>
+      <div style="flex:1;min-width:0;">
+        <div style="font-size:11px;font-weight:700;color:var(--muted);letter-spacing:.6px;text-transform:uppercase;margin-bottom:5px;">Live Preview URL</div>
+        <div class="mono" style="font-size:14px;color:var(--brand);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">/p/{pid}</div>
+      </div>
+      <a href="/p/{pid}" target="_blank" rel="noopener"
+         class="btn-primary" style="text-decoration:none;padding:10px 22px;border-radius:8px;font-size:13px;white-space:nowrap;flex-shrink:0;">
+        Open App ↗
+      </a>
+    </div>
+
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:28px;">
       <div class="card" style="padding:24px;">
         <div style="font-size:12px;color:var(--muted);font-weight:600;letter-spacing:.5px;text-transform:uppercase;margin-bottom:16px;">Configuration</div>
@@ -2548,7 +2561,196 @@ async def platform_status(request: Request):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# SECTION 16: ENTRYPOINT
+# SECTION 16: APP PROXY — /p/{project_id}[/{path}]
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _proxy_not_running_html(project_id: str, status: str) -> str:
+    """HTML page shown when the app is not reachable."""
+    status_label = status.upper() if status else "UNKNOWN"
+    status_css = (
+        "status-building" if status in ("building", "pending", "restarting")
+        else "status-failed" if status in ("failed", "stopped")
+        else "status-pending"
+    )
+    hint = {
+        "building":   "Your app is still being built. This page will refresh automatically.",
+        "pending":    "Deployment is queued. Hang tight…",
+        "restarting": "Deployment is restarting. Refreshing shortly…",
+        "failed":     "The deployment failed. Check the logs for details.",
+        "stopped":    "This app has been stopped. Restart it from the dashboard.",
+    }.get(status, "The app is not currently running.")
+
+    auto_refresh = "true" if status in ("building", "pending", "restarting") else "false"
+
+    body = f"""
+<div class="grid-dots" style="min-height:100vh;display:flex;align-items:center;justify-content:center;padding:40px 20px;">
+  <div class="animate-in" style="text-align:center;max-width:480px;">
+    <div class="logo-text" style="font-size:52px;margin-bottom:20px;">&#x25B6;</div>
+    <h1 style="margin:0 0 12px;font-size:26px;font-weight:800;">App Not Reachable</h1>
+
+    <span class="status-badge {status_css}" style="font-size:13px;margin-bottom:20px;display:inline-flex;">
+      <span class="dot dot-{'building' if status in ('building','pending','restarting') else 'failed'}"></span>
+      {status_label}
+    </span>
+
+    <p style="margin:20px 0 28px;color:var(--muted);font-size:14px;line-height:1.7;">{hint}</p>
+
+    <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap;">
+      <a href="/project/{project_id}" class="btn-secondary"
+         style="text-decoration:none;padding:10px 20px;border-radius:8px;font-size:13px;">
+        📋 View Project
+      </a>
+      <button onclick="location.reload()" class="btn-primary"
+              style="padding:10px 20px;border-radius:8px;font-size:13px;">
+        ⟳ Retry
+      </button>
+    </div>
+
+    <div id="countdown" style="margin-top:24px;font-size:12px;color:var(--muted);font-family:'Space Mono',monospace;"></div>
+  </div>
+</div>
+
+<script>
+const autoRefresh = {auto_refresh};
+if (autoRefresh) {{
+  let secs = 5;
+  const el = document.getElementById('countdown');
+  const tick = () => {{
+    el.textContent = 'Auto-refreshing in ' + secs + 's…';
+    if (--secs < 0) location.reload();
+    else setTimeout(tick, 1000);
+  }};
+  tick();
+}}
+</script>"""
+    return _base_html("App Preview", body)
+
+
+async def _proxy_request(
+    request: Request,
+    target_url: str,
+) -> Response:
+    """
+    Forward an HTTP request to *target_url* and return the response.
+    Rewrites Location headers so redirects stay inside the /p/<id> prefix.
+    """
+    # Build forwarded headers (drop hop-by-hop)
+    skip_headers = {
+        "host", "connection", "keep-alive", "transfer-encoding",
+        "te", "trailer", "upgrade", "proxy-authorization",
+        "proxy-authenticate", "content-length",
+    }
+    fwd_headers = {
+        k: v for k, v in request.headers.items()
+        if k.lower() not in skip_headers
+    }
+    fwd_headers["x-forwarded-for"] = request.client.host if request.client else "unknown"
+    fwd_headers["x-forwarded-proto"] = request.url.scheme
+    fwd_headers["x-real-ip"] = request.client.host if request.client else "unknown"
+
+    body = await request.body()
+
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=False,
+            timeout=httpx.Timeout(30.0),
+        ) as client:
+            resp = await client.request(
+                method=request.method,
+                url=target_url,
+                headers=fwd_headers,
+                content=body,
+                params=dict(request.query_params),
+            )
+
+        # Forward response headers (skip hop-by-hop)
+        skip_resp = {"transfer-encoding", "connection", "keep-alive"}
+        resp_headers = {
+            k: v for k, v in resp.headers.items()
+            if k.lower() not in skip_resp
+        }
+
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            headers=resp_headers,
+            media_type=resp.headers.get("content-type"),
+        )
+
+    except (httpx.ConnectError, httpx.ConnectTimeout, ConnectionRefusedError):
+        return None  # caller will show not-running page
+    except Exception as e:
+        logger.warning(f"Proxy error → {target_url}: {e}")
+        return None
+
+
+@app.get("/p/{project_id}", response_class=HTMLResponse)
+@app.post("/p/{project_id}")
+@app.put("/p/{project_id}")
+@app.patch("/p/{project_id}")
+@app.delete("/p/{project_id}")
+async def proxy_app_root(request: Request, project_id: str):
+    """Proxy the root path of a deployed app."""
+    return await _proxy_app(request, project_id, "")
+
+
+@app.api_route(
+    "/p/{project_id}/{path:path}",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
+)
+async def proxy_app_path(request: Request, project_id: str, path: str):
+    """Proxy any sub-path of a deployed app."""
+    return await _proxy_app(request, project_id, path)
+
+
+async def _proxy_app(request: Request, project_id: str, path: str):
+    """
+    Core proxy logic:
+      1. Look up the project → get its port & status.
+      2. If not running, show a friendly status page.
+      3. Otherwise forward the request to http://localhost:{port}/{path}.
+    """
+    # ── Fetch project (no auth required — public proxy) ──────────────
+    try:
+        project = await db_get_project(project_id)
+    except Exception:
+        project = None
+
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found.")
+
+    status = project.get("status", "unknown")
+    port = project.get("port")
+
+    # ── Not ready to proxy ────────────────────────────────────────────
+    if status != DeployState.RUNNING or not port:
+        return HTMLResponse(
+            content=_proxy_not_running_html(project_id, status),
+            status_code=503 if status in ("failed", "stopped") else 202,
+        )
+
+    # ── Build target URL ──────────────────────────────────────────────
+    clean_path = path.lstrip("/") if path else ""
+    qs = str(request.url.query)
+    target = f"http://127.0.0.1:{port}/{clean_path}"
+    if qs:
+        target += f"?{qs}"
+
+    # ── Proxy the request ─────────────────────────────────────────────
+    proxied = await _proxy_request(request, target)
+
+    if proxied is None:
+        # Process crashed or not listening yet
+        return HTMLResponse(
+            content=_proxy_not_running_html(project_id, "stopped"),
+            status_code=503,
+        )
+
+    return proxied
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SECTION 17: ENTRYPOINT
 # ──────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
