@@ -87,6 +87,21 @@ MAX_CONCURRENT_DEPLOYMENTS: int = int(os.environ.get("MAX_CONCURRENT_DEPLOYMENTS
 STORAGE_BUCKET: str = os.environ.get("STORAGE_BUCKET", "pydeploy-projects")
 PLATFORM_TITLE: str = "PyDeploy"
 
+# OpenRouter AI config (for auto-fix agent)
+OPENROUTER_API_KEY: str = os.environ.get("OPENROUTER_API_KEY", "")
+OPENROUTER_BASE: str = "https://openrouter.ai/api/v1/chat/completions"
+# Free models on OpenRouter (verified free tier, tried in order)
+OPENROUTER_MODELS: List[str] = [
+    "deepseek/deepseek-chat-v3-0324:free",      # DeepSeek V3 — very capable, free
+    "google/gemma-3-27b-it:free",               # Google Gemma 3 27B
+    "meta-llama/llama-4-maverick:free",          # Llama 4 Maverick
+    "microsoft/phi-4-reasoning:free",            # Microsoft Phi-4
+    "qwen/qwen3-235b-a22b:free",                # Qwen3 235B MoE
+    "mistralai/mistral-7b-instruct:free",        # Mistral 7B fallback
+]
+AI_MAX_ROUNDS: int = 30        # max tool-call iterations per fix session
+AI_CMD_TIMEOUT: int = 180      # seconds per shell command
+
 # Deployment states
 class DeployState:
     PENDING    = "pending"
@@ -1051,57 +1066,82 @@ async def start_app_process(
         return None
 
 
+_ERROR_WORDS  = {"error", "exception", "traceback", "critical", "fatal", "panic", "oserror", "ioerror", "syntaxerror", "importerror", "modulenotfounderror", "valueerror", "typeerror", "runtimeerror", "attributeerror", "keyerror", "indexerror", "filenotfounderror", "permissionerror", "connectionerror", "killed", "segfault", "abort"}
+_WARNING_WORDS = {"warning", "warn", "deprecated", "deprecation", "userwarning", "runtimewarning", "futurewarn", "insecure", "caution"}
+
+
+def _classify_log_line(line: str) -> tuple:
+    """Return (level, source) for a raw log line."""
+    low = line.lower()
+    # Traceback lines
+    if line.startswith("Traceback") or line.startswith("  File "):
+        return "error", "stderr"
+    if any(w in low for w in _ERROR_WORDS):
+        return "error", "stderr"
+    if any(w in low for w in _WARNING_WORDS):
+        return "warning", "stdout"
+    return "info", "stdout"
+
+
 async def tail_log_to_db(
     log_path: str,
     deployment_id: str,
     project_id: str,
     proc: subprocess.Popen,
-    interval: float = 3.0,
+    interval: float = 0.5,          # poll every 500ms — much faster
 ):
-    """Background task: tail log file and push lines to Supabase."""
+    """Background task: tail log file and push ALL lines to Supabase."""
     position = 0
-    batch_size = 20
 
     while True:
         await asyncio.sleep(interval)
 
-        # Check if process died
-        process_alive = proc.poll() is None
-
+        # Read new log data first, then check if process died
         try:
             if os.path.exists(log_path):
-                async with aiofiles.open(log_path, "r") as f:
+                async with aiofiles.open(log_path, "r", errors="replace") as f:
                     await f.seek(position)
                     new_content = await f.read()
                     position = await f.tell()
 
-                if new_content.strip():
-                    lines = new_content.strip().splitlines()
-                    for i in range(0, len(lines), batch_size):
-                        chunk = lines[i : i + batch_size]
-                        for line in chunk:
-                            if line.strip():
-                                level = "error" if any(
-                                    w in line.lower()
-                                    for w in ["error", "exception", "traceback", "critical"]
-                                ) else "info"
-                                await db_add_log(
-                                    deployment_id, project_id,
-                                    line,
-                                    level=level,
-                                    source="stdout",
-                                )
+                if new_content:
+                    lines = new_content.splitlines()
+                    for line in lines:
+                        raw = line.rstrip()
+                        if not raw:
+                            continue
+                        level, source = _classify_log_line(raw)
+                        await db_add_log(
+                            deployment_id, project_id,
+                            raw,
+                            level=level,
+                            source=source,
+                        )
         except Exception as e:
             logger.warning(f"Log tail error: {e}")
 
+        process_alive = proc.poll() is None
         if not process_alive:
+            # Drain any remaining log data
+            try:
+                if os.path.exists(log_path):
+                    async with aiofiles.open(log_path, "r", errors="replace") as f:
+                        await f.seek(position)
+                        remainder = await f.read()
+                    for line in remainder.splitlines():
+                        if line.strip():
+                            level, source = _classify_log_line(line.rstrip())
+                            await db_add_log(deployment_id, project_id, line.rstrip(), level=level, source=source)
+            except Exception:
+                pass
+
+            exit_code = proc.returncode
             await db_add_log(
                 deployment_id, project_id,
-                f"Process exited with code: {proc.returncode}",
-                level="warning" if proc.returncode != 0 else "info",
+                f"Process exited with code: {exit_code}",
+                level="error" if exit_code and exit_code != 0 else "info",
                 source="runtime",
             )
-            # Update deployment status
             try:
                 await db_update_deployment(deployment_id, {
                     "status": DeployState.STOPPED,
@@ -1109,6 +1149,12 @@ async def tail_log_to_db(
                 })
             except Exception:
                 pass
+
+            # Auto-trigger AI fix if process crashed unexpectedly
+            if exit_code and exit_code != 0:
+                asyncio.create_task(
+                    ai_auto_fix(deployment_id, project_id, trigger="crash")
+                )
             break
 
 
@@ -1279,7 +1325,14 @@ async def run_deployment(
         )
 
         if pid is None:
-            raise RuntimeError("Application process failed to start.")
+            # Read last 60 lines from the log to understand why it failed
+            crash_log = ""
+            log_path = os.path.join(deploy_dir, "deploy.log")
+            if os.path.exists(log_path):
+                with open(log_path, "r", errors="replace") as f:
+                    lines = f.readlines()
+                crash_log = "".join(lines[-60:])
+            raise RuntimeError(f"Application process failed to start.\n{crash_log}")
 
         # ── Step 7: Mark as running ────────────────────────────────────
         await db_update_deployment(deployment_id, {
@@ -1302,7 +1355,7 @@ async def run_deployment(
 
         await db_add_log(
             deployment_id, project_id,
-            f"❌ Deployment failed: {str(e)}",
+            f"❌ Deployment failed: {str(e)[:500]}",
             level="error",
             source="system",
         )
@@ -1311,18 +1364,15 @@ async def run_deployment(
             "error_msg": str(e)[:2000],
             "finished_at": datetime.now(timezone.utc).isoformat(),
         })
-        # Clear deploy_dir in DB so restart doesn't reference a deleted path
         await db_update_project(project_id, {
             "status": DeployState.FAILED,
-            "deploy_dir": None,
+            "deploy_dir": deploy_dir,   # keep dir so AI can fix files
         })
 
-        # Cleanup on failure — only wipe the dir if process never started
-        # (if it started but crashed, keep logs for debugging)
-        try:
-            shutil.rmtree(deploy_dir, ignore_errors=True)
-        except Exception:
-            pass
+        # Trigger AI auto-fix in background — it has full access to fix and redeploy
+        asyncio.create_task(
+            ai_auto_fix(deployment_id, project_id, trigger="build_failure")
+        )
 
 
 async def restart_deployment(project_id: str, deployment_id: str) -> bool:
@@ -1384,6 +1434,859 @@ async def restart_deployment(project_id: str, deployment_id: str) -> bool:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# SECTION 11.5: AI ULTRA AGENT
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# Full-autonomy DevOps AI agent. Has complete control over the project:
+#   run_command    — any shell command with venv activated
+#   read_file      — read any file in full
+#   write_file     — overwrite any file with new content
+#   patch_file     — surgical line-level edits (insert/replace/delete lines)
+#   delete_file    — delete a file
+#   rename_file    — rename or move a file/directory
+#   create_dir     — create a directory tree
+#   delete_dir     — remove a directory recursively
+#   list_files     — recursive listing with sizes
+#   search_in_files— grep-style search across project source
+#   get_env        — show current environment variables
+#   restart_app    — restart the app process
+#   mark_fixed     — signal completion
+# ──────────────────────────────────────────────────────────────────────────────
+
+_ai_fixing: Dict[str, bool] = {}
+
+
+# ── OpenRouter caller with model fallback ────────────────────────────────────
+
+async def _ai_call_openrouter(messages: List[Dict], tools: List[Dict]) -> Optional[Dict]:
+    """Try each free model in order, return first successful assistant message."""
+    if not OPENROUTER_API_KEY:
+        return None
+
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://pydeploy.app",
+        "X-Title": "PyDeploy Ultra Agent",
+    }
+
+    for model in OPENROUTER_MODELS:
+        try:
+            payload = {
+                "model": model,
+                "messages": messages,
+                "tools": tools,
+                "tool_choice": "auto",
+                "max_tokens": 4096,
+                "temperature": 0.15,
+            }
+            async with httpx.AsyncClient(timeout=httpx.Timeout(90.0)) as client:
+                resp = await client.post(OPENROUTER_BASE, json=payload, headers=headers)
+
+            if resp.status_code == 200:
+                data = resp.json()
+                choice = data.get("choices", [{}])[0]
+                msg = choice.get("message", {})
+                finish = choice.get("finish_reason", "")
+                logger.info(f"AI agent: model={model} finish={finish} tokens={data.get('usage',{})}")
+                return msg
+            else:
+                err = resp.text[:200]
+                logger.warning(f"AI model {model} → {resp.status_code}: {err}")
+        except Exception as e:
+            logger.warning(f"AI model {model} error: {e}")
+
+    return None
+
+
+# ── Tool schema ──────────────────────────────────────────────────────────────
+
+_AI_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "run_command",
+            "description": (
+                "Execute ANY shell command in the project environment. "
+                "The project venv is auto-activated. Use this to: install packages, "
+                "run tests, lint code, check syntax, fix permissions, compile, migrate DB, "
+                "or do anything a senior devops engineer would do in a terminal. "
+                "Always check output for errors before proceeding."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Shell command to run"},
+                    "cwd": {"type": "string", "description": "Working directory relative to project root (default: project root)"},
+                    "timeout": {"type": "integer", "description": "Max seconds to wait (default 180)"},
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read the complete content of any file. Always read a file before editing it.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path relative to project root"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": (
+                "Write (create or completely overwrite) a file. "
+                "Use this when rewriting an entire file is cleaner than patching. "
+                "For surgical edits to specific lines use patch_file instead."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path relative to project root"},
+                    "content": {"type": "string", "description": "Complete new file content"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "patch_file",
+            "description": (
+                "Surgically edit specific lines of a file without rewriting it entirely. "
+                "Operations: 'replace' a line range, 'insert' lines before a line number, "
+                "'delete' a line range, 'append' lines to end of file. "
+                "Line numbers are 1-indexed. Read the file first to get accurate line numbers."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path relative to project root"},
+                    "operation": {
+                        "type": "string",
+                        "enum": ["replace", "insert", "delete", "append"],
+                        "description": "Type of edit",
+                    },
+                    "start_line": {"type": "integer", "description": "First line number to affect (1-indexed, for replace/insert/delete)"},
+                    "end_line": {"type": "integer", "description": "Last line number to affect inclusive (for replace/delete)"},
+                    "content": {"type": "string", "description": "New content (for replace/insert/append). Use \\n between lines."},
+                },
+                "required": ["path", "operation"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_file",
+            "description": "Delete a file from the project.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path relative to project root"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "rename_file",
+            "description": "Rename or move a file or directory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "src":  {"type": "string", "description": "Source path relative to project root"},
+                    "dest": {"type": "string", "description": "Destination path relative to project root"},
+                },
+                "required": ["src", "dest"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_dir",
+            "description": "Create a directory (and all parents) in the project.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Directory path relative to project root"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_dir",
+            "description": "Recursively delete an entire directory from the project. Use with caution.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Directory path relative to project root"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_files",
+            "description": "Recursively list all files in the project (or a subdirectory) with sizes. Use this to understand project structure.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Sub-path relative to project root (default: .)"},
+                    "show_hidden": {"type": "boolean", "description": "Include hidden files/dirs (default false)"},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_in_files",
+            "description": "Search for a string or pattern across all project source files. Returns matching file:line:content.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "String or regex to search for"},
+                    "file_glob": {"type": "string", "description": "File pattern to limit search e.g. '*.py' (default: all text files)"},
+                    "case_sensitive": {"type": "boolean", "description": "Case sensitive (default false)"},
+                },
+                "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_env",
+            "description": "Show environment variables and Python/system info available to the app.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "restart_app",
+            "description": (
+                "Restart the application after all fixes are applied. "
+                "Call this once you believe all issues are resolved. "
+                "Returns whether the process started successfully."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "mark_fixed",
+            "description": "Signal that the fix session is complete. Always call this at the end — success or failure.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "success": {"type": "boolean", "description": "True if issue was resolved, False if unable to fix"},
+                    "summary": {"type": "string", "description": "Clear summary of what was done and what remains if any"},
+                },
+                "required": ["success", "summary"],
+            },
+        },
+    },
+]
+
+
+# ── Tool executor ────────────────────────────────────────────────────────────
+
+def _resolve_path(project_dir: str, rel: str) -> str:
+    """Safely resolve a relative path inside the project dir."""
+    if os.path.isabs(rel):
+        # Allow absolute paths only inside project_dir for safety
+        if rel.startswith(project_dir):
+            return rel
+        return os.path.join(project_dir, rel.lstrip("/"))
+    full = os.path.normpath(os.path.join(project_dir, rel))
+    # Prevent path traversal outside project dir
+    if not full.startswith(os.path.normpath(project_dir)):
+        return os.path.join(project_dir, rel.lstrip("/"))
+    return full
+
+
+async def _ai_log(deployment_id: str, project_id: str, msg: str, level: str = "info"):
+    await db_add_log(deployment_id, project_id, msg, level=level, source="ai")
+
+
+async def _ai_exec_tool(
+    tool_name: str,
+    tool_args: Dict,
+    project_dir: str,
+    deployment_id: str,
+    project_id: str,
+    _restart_context: Dict,   # mutable dict so restart_app can set flags
+) -> str:
+    """Execute a tool call, log it, and return string result for the AI."""
+
+    # Pretty-print args for log
+    args_preview = ", ".join(
+        f"{k}={repr(str(v)[:80])}"
+        for k, v in tool_args.items()
+        if k not in ("content",)  # skip content spam
+    )
+    await _ai_log(deployment_id, project_id,
+        f"🔧 {tool_name}({args_preview})")
+
+    # ── run_command ──────────────────────────────────────────────────────────
+    if tool_name == "run_command":
+        cmd = tool_args.get("command", "").strip()
+        rel_cwd = tool_args.get("cwd", ".")
+        cwd = _resolve_path(project_dir, rel_cwd) if rel_cwd != "." else project_dir
+        timeout = int(tool_args.get("timeout", AI_CMD_TIMEOUT))
+
+        venv_bin = os.path.join(project_dir, ".venv", "bin")
+        env = {
+            **os.environ,
+            "PATH": f"{venv_bin}:{os.environ.get('PATH','')}",
+            "VIRTUAL_ENV": os.path.join(project_dir, ".venv"),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONUNBUFFERED": "1",
+        }
+
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                cmd, cwd=cwd, env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            try:
+                out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            except asyncio.TimeoutError:
+                try: proc.kill()
+                except Exception: pass
+                out = b"[COMMAND TIMED OUT]"
+
+            output = out.decode("utf-8", errors="replace").strip()
+            rc = proc.returncode if proc.returncode is not None else -1
+
+        except Exception as exc:
+            output = f"[ERROR launching command]: {exc}"
+            rc = -1
+
+        # Stream output lines to logs
+        lines = output.splitlines()
+        for line in lines[-120:]:
+            if line.strip():
+                lvl, _ = _classify_log_line(line)
+                await _ai_log(deployment_id, project_id, f"   {line}", lvl)
+
+        result = f"exit_code={rc}\n{output}"
+        return result[-6000:]
+
+    # ── read_file ────────────────────────────────────────────────────────────
+    elif tool_name == "read_file":
+        rel = tool_args.get("path", "")
+        full = _resolve_path(project_dir, rel)
+        try:
+            with open(full, "r", errors="replace") as f:
+                lines = f.readlines()
+            # Return with line numbers for patch_file accuracy
+            numbered = "".join(f"{i+1:4d}│ {l}" for i, l in enumerate(lines))
+            await _ai_log(deployment_id, project_id,
+                f"   📄 {rel}  ({len(lines)} lines)")
+            return numbered[:40_000]
+        except Exception as e:
+            return f"[ERROR]: {e}"
+
+    # ── write_file ───────────────────────────────────────────────────────────
+    elif tool_name == "write_file":
+        rel = tool_args.get("path", "")
+        full = _resolve_path(project_dir, rel)
+        text = tool_args.get("content", "")
+        try:
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "w") as f:
+                f.write(text)
+            lines = text.count("\n") + 1
+            await _ai_log(deployment_id, project_id,
+                f"   ✏️  Wrote {rel}  ({lines} lines, {len(text)} bytes)")
+            return f"OK — wrote {len(text)} bytes to {rel}"
+        except Exception as e:
+            return f"[ERROR]: {e}"
+
+    # ── patch_file ───────────────────────────────────────────────────────────
+    elif tool_name == "patch_file":
+        rel       = tool_args.get("path", "")
+        operation = tool_args.get("operation", "")
+        start     = tool_args.get("start_line")
+        end       = tool_args.get("end_line")
+        new_text  = tool_args.get("content", "")
+        full      = _resolve_path(project_dir, rel)
+
+        try:
+            with open(full, "r", errors="replace") as f:
+                lines = f.readlines()
+
+            orig_count = len(lines)
+
+            if operation == "replace":
+                s, e = int(start) - 1, int(end)
+                new_lines = [(l if l.endswith("\n") else l + "\n")
+                             for l in new_text.split("\n")]
+                lines = lines[:s] + new_lines + lines[e:]
+                await _ai_log(deployment_id, project_id,
+                    f"   ✂️  Replaced lines {start}-{end} in {rel}")
+
+            elif operation == "insert":
+                s = int(start) - 1
+                new_lines = [(l if l.endswith("\n") else l + "\n")
+                             for l in new_text.split("\n")]
+                lines = lines[:s] + new_lines + lines[s:]
+                await _ai_log(deployment_id, project_id,
+                    f"   ➕ Inserted {len(new_lines)} lines before line {start} in {rel}")
+
+            elif operation == "delete":
+                s, e = int(start) - 1, int(end)
+                deleted = e - s
+                lines = lines[:s] + lines[e:]
+                await _ai_log(deployment_id, project_id,
+                    f"   🗑️  Deleted lines {start}-{end} ({deleted} lines) from {rel}")
+
+            elif operation == "append":
+                new_lines = [(l if l.endswith("\n") else l + "\n")
+                             for l in new_text.split("\n")]
+                lines = lines + new_lines
+                await _ai_log(deployment_id, project_id,
+                    f"   ➕ Appended {len(new_lines)} lines to {rel}")
+
+            else:
+                return f"[ERROR]: unknown operation '{operation}'"
+
+            with open(full, "w") as f:
+                f.writelines(lines)
+
+            return f"OK — {operation} applied to {rel}. Lines: {orig_count} → {len(lines)}"
+
+        except Exception as e:
+            return f"[ERROR patching {rel}]: {e}"
+
+    # ── delete_file ──────────────────────────────────────────────────────────
+    elif tool_name == "delete_file":
+        rel = tool_args.get("path", "")
+        full = _resolve_path(project_dir, rel)
+        try:
+            os.remove(full)
+            await _ai_log(deployment_id, project_id, f"   🗑️  Deleted file {rel}")
+            return f"OK — deleted {rel}"
+        except Exception as e:
+            return f"[ERROR]: {e}"
+
+    # ── rename_file ──────────────────────────────────────────────────────────
+    elif tool_name == "rename_file":
+        src  = tool_args.get("src", "")
+        dest = tool_args.get("dest", "")
+        full_src  = _resolve_path(project_dir, src)
+        full_dest = _resolve_path(project_dir, dest)
+        try:
+            os.makedirs(os.path.dirname(full_dest), exist_ok=True)
+            shutil.move(full_src, full_dest)
+            await _ai_log(deployment_id, project_id, f"   📦 Renamed {src} → {dest}")
+            return f"OK — renamed {src} to {dest}"
+        except Exception as e:
+            return f"[ERROR]: {e}"
+
+    # ── create_dir ───────────────────────────────────────────────────────────
+    elif tool_name == "create_dir":
+        rel = tool_args.get("path", "")
+        full = _resolve_path(project_dir, rel)
+        try:
+            os.makedirs(full, exist_ok=True)
+            await _ai_log(deployment_id, project_id, f"   📁 Created dir {rel}")
+            return f"OK — created {rel}"
+        except Exception as e:
+            return f"[ERROR]: {e}"
+
+    # ── delete_dir ───────────────────────────────────────────────────────────
+    elif tool_name == "delete_dir":
+        rel = tool_args.get("path", "")
+        full = _resolve_path(project_dir, rel)
+        # Extra safety: don't delete the project root
+        if os.path.normpath(full) == os.path.normpath(project_dir):
+            return "[ERROR]: refusing to delete project root directory"
+        try:
+            shutil.rmtree(full)
+            await _ai_log(deployment_id, project_id, f"   🗑️  Deleted dir {rel}")
+            return f"OK — deleted directory {rel}"
+        except Exception as e:
+            return f"[ERROR]: {e}"
+
+    # ── list_files ───────────────────────────────────────────────────────────
+    elif tool_name == "list_files":
+        rel = tool_args.get("path", ".")
+        show_hidden = tool_args.get("show_hidden", False)
+        base = _resolve_path(project_dir, rel)
+        try:
+            entries = []
+            skip_dirs = {".venv", "node_modules", "__pycache__", ".git",
+                         ".pytest_cache", "dist", "build", ".next"}
+            for root, dirs, files in os.walk(base):
+                if not show_hidden:
+                    dirs[:] = [d for d in dirs
+                                if not d.startswith(".") and d not in skip_dirs]
+                else:
+                    dirs[:] = [d for d in dirs if d not in skip_dirs]
+                for name in sorted(files):
+                    if not show_hidden and name.startswith("."):
+                        continue
+                    fp = os.path.join(root, name)
+                    rel_path = os.path.relpath(fp, project_dir)
+                    try:
+                        size = os.path.getsize(fp)
+                        size_str = f"{size:,}B" if size < 1024 else f"{size//1024}KB"
+                    except Exception:
+                        size_str = "?"
+                    entries.append(f"{rel_path}  ({size_str})")
+                if len(entries) >= 300:
+                    break
+            result = "\n".join(entries[:300])
+            await _ai_log(deployment_id, project_id,
+                f"   📂 Listed {len(entries)} files under '{rel}'")
+            return result or "(empty directory)"
+        except Exception as e:
+            return f"[ERROR]: {e}"
+
+    # ── search_in_files ──────────────────────────────────────────────────────
+    elif tool_name == "search_in_files":
+        pattern  = tool_args.get("pattern", "")
+        glob_pat = tool_args.get("file_glob", "*")
+        case_sen = tool_args.get("case_sensitive", False)
+        try:
+            flags = 0 if case_sen else re.IGNORECASE
+            rx = re.compile(pattern, flags)
+            matches = []
+            skip_dirs = {".venv", "node_modules", "__pycache__", ".git"}
+            for root, dirs, files in os.walk(project_dir):
+                dirs[:] = [d for d in dirs if d not in skip_dirs]
+                for name in files:
+                    import fnmatch
+                    if glob_pat != "*" and not fnmatch.fnmatch(name, glob_pat):
+                        continue
+                    fp = os.path.join(root, name)
+                    rel_path = os.path.relpath(fp, project_dir)
+                    try:
+                        with open(fp, "r", errors="replace") as f:
+                            for i, line in enumerate(f, 1):
+                                if rx.search(line):
+                                    matches.append(
+                                        f"{rel_path}:{i}: {line.rstrip()}"
+                                    )
+                                    if len(matches) >= 100:
+                                        break
+                    except Exception:
+                        continue
+                if len(matches) >= 100:
+                    break
+            await _ai_log(deployment_id, project_id,
+                f"   🔍 Search '{pattern}' → {len(matches)} matches")
+            return "\n".join(matches) or f"No matches for '{pattern}'"
+        except Exception as e:
+            return f"[ERROR]: {e}"
+
+    # ── get_env ──────────────────────────────────────────────────────────────
+    elif tool_name == "get_env":
+        venv_bin = os.path.join(project_dir, ".venv", "bin")
+        py = os.path.join(venv_bin, "python3")
+        env_lines = []
+        for k in sorted(os.environ):
+            if any(skip in k.upper() for skip in ("KEY","SECRET","PASSWORD","TOKEN")):
+                env_lines.append(f"  {k}=***REDACTED***")
+            else:
+                env_lines.append(f"  {k}={os.environ[k][:120]}")
+        result = "\n".join([
+            f"Python venv: {py}  (exists={os.path.exists(py)})",
+            f"Project dir: {project_dir}",
+            f"Platform: {sys.platform}",
+            "",
+            "Environment:",
+            *env_lines,
+        ])
+        await _ai_log(deployment_id, project_id, "   🌍 Got environment info")
+        return result[:8000]
+
+    # ── restart_app ──────────────────────────────────────────────────────────
+    elif tool_name == "restart_app":
+        try:
+            project    = await db_get_project(project_id)
+            deployment = await db_get_deployment(deployment_id)
+            if not project or not deployment:
+                return "ERROR: project or deployment record not found"
+
+            startup_cmd = project.get("startup_cmd") or deployment.get("startup_cmd", "")
+            env_vars    = project.get("env_vars") or {}
+
+            if not startup_cmd:
+                return "ERROR: no startup_cmd set — update it first"
+
+            # Stop existing process
+            await stop_deployment_process(deployment_id)
+            await asyncio.sleep(1)
+
+            port = allocate_port()
+            await db_update_deployment(deployment_id, {"port": port, "status": DeployState.RESTARTING})
+            await db_update_project(project_id, {"port": port})
+
+            pid = await start_app_process(
+                project_dir=project_dir,
+                startup_cmd=startup_cmd,
+                port=port,
+                deployment_id=deployment_id,
+                project_id=project_id,
+                env_vars=env_vars,
+            )
+
+            if pid:
+                await db_update_deployment(deployment_id, {"status": DeployState.RUNNING, "pid": pid})
+                await db_update_project(project_id, {"status": DeployState.RUNNING})
+                _restart_context["restarted"] = True
+                _restart_context["port"] = port
+                await _ai_log(deployment_id, project_id,
+                    f"   ✅ App restarted — port={port} PID={pid}")
+                # Give it 3s then check it's still alive
+                await asyncio.sleep(3)
+                proc_info = _running_processes.get(deployment_id)
+                if proc_info and proc_info["process"].poll() is not None:
+                    await _ai_log(deployment_id, project_id,
+                        "   ⚠️  Process died immediately after restart — still broken",
+                        "warning")
+                    return f"FAILED — process started (PID {pid}) but crashed immediately"
+                return f"OK — app running on port {port} (PID {pid})"
+            else:
+                _restart_context["restarted"] = False
+                await _ai_log(deployment_id, project_id,
+                    "   ❌ Restart failed — process exited at startup", "error")
+                return "FAILED — process exited immediately after launch"
+        except Exception as e:
+            return f"[ERROR restarting]: {e}"
+
+    # ── mark_fixed ───────────────────────────────────────────────────────────
+    elif tool_name == "mark_fixed":
+        success = tool_args.get("success", False)
+        summary = tool_args.get("summary", "")
+        icon = "✅" if success else "❌"
+        await _ai_log(deployment_id, project_id,
+            f"🤖 AI session complete {icon}: {summary}")
+        return "acknowledged"
+
+    return f"[Unknown tool: {tool_name}]"
+
+
+# ── Main agent loop ──────────────────────────────────────────────────────────
+
+async def ai_auto_fix(deployment_id: str, project_id: str, trigger: str = "failure"):
+    """
+    Ultra AI Agent main loop.
+    - Gathers full context (logs, files, env)
+    - Calls LLM with tool-use in a loop
+    - Agent can do anything: edit files, install packages, fix code, restart app
+    - Runs until mark_fixed is called or AI_MAX_ROUNDS exhausted
+    """
+    if not OPENROUTER_API_KEY:
+        await db_add_log(deployment_id, project_id,
+            "⚠️  AI agent disabled — set OPENROUTER_API_KEY env var",
+            level="warning", source="ai")
+        return
+
+    if _ai_fixing.get(deployment_id):
+        return
+    _ai_fixing[deployment_id] = True
+
+    try:
+        await _ai_log(deployment_id, project_id,
+            f"🤖 ═══ AI ULTRA AGENT STARTING (trigger={trigger}) ═══")
+
+        project    = await db_get_project(project_id)
+        deployment = await db_get_deployment(deployment_id)
+        logs       = await db_get_logs(deployment_id, limit=200)
+
+        project_dir = (project or {}).get("deploy_dir", "")
+        if not project_dir or not os.path.isdir(project_dir):
+            await _ai_log(deployment_id, project_id,
+                "🤖 AI: project directory not found, cannot proceed", "error")
+            return
+
+        # ── Build context for initial prompt ────────────────────────────
+        log_tail = "\n".join(
+            f"[{l.get('level','info').upper():7s}] [{l.get('source','?'):8s}] {l.get('message','')}"
+            for l in logs[-200:]
+        )
+
+        # Quick project tree
+        tree_lines = []
+        skip = {".venv","node_modules","__pycache__",".git","dist","build",".next"}
+        for root, dirs, files in os.walk(project_dir):
+            dirs[:] = [d for d in dirs if d not in skip and not d.startswith(".")]
+            depth = root.replace(project_dir, "").count(os.sep)
+            indent = "  " * depth
+            folder = os.path.basename(root)
+            if depth > 0:
+                tree_lines.append(f"{indent}📁 {folder}/")
+            for f in sorted(files):
+                tree_lines.append(f"{'  '*(depth+1)}📄 {f}")
+            if len(tree_lines) > 80: break
+
+        # Check if requirements.txt exists and read it
+        req_path = os.path.join(project_dir, "requirements.txt")
+        req_content = ""
+        if os.path.exists(req_path):
+            with open(req_path, "r", errors="replace") as f:
+                req_content = f.read(3000)
+
+        system_prompt = f"""You are PyDeploy Ultra Agent — an elite, fully autonomous DevOps AI.
+Your mission: diagnose and completely fix a Python application that failed to deploy or crashed.
+
+You have TOTAL control via tools:
+- Run ANY shell command (install packages, check syntax, run tests, etc.)
+- Read, create, overwrite, or surgically patch any file (add/remove/edit specific lines)
+- Create and delete directories and files
+- Search across all project files
+- Restart the app when fixes are applied
+
+YOUR APPROACH (follow this exactly):
+1. READ the error logs carefully — identify the ROOT CAUSE
+2. EXPLORE the project structure with list_files and read the relevant files
+3. PLAN your fix — think step by step
+4. EXECUTE: make changes using write_file or patch_file, install deps with run_command
+5. VERIFY: run_command to check syntax/imports: `python3 -c "import app"` or `python3 -m py_compile app.py`
+6. RESTART the app with restart_app
+7. If still failing, read the new logs and iterate — up to {AI_MAX_ROUNDS} rounds total
+8. Call mark_fixed at the end with success=true/false and a clear summary
+
+RULES:
+- Always read a file before editing it (you need accurate line numbers for patch_file)
+- When editing, prefer patch_file for small changes, write_file for large rewrites
+- Install missing packages: `.venv/bin/pip install <package>` — NEVER use bare `pip`
+- Fix port binding: ensure app binds to 0.0.0.0 and uses the PORT env var
+- Fix import errors: check requirements.txt and install missing packages
+- Fix syntax errors: read the file, find the bug, patch it
+- If startup_cmd is wrong, fix it: update the file or run_command to test correct cmd
+- NEVER give up without trying multiple approaches
+- Be concise in mark_fixed summary but specific about what was changed
+
+Framework: {deployment.get("framework", "unknown")}
+Startup command: {deployment.get("startup_cmd", "unknown")}
+Trigger: {trigger}
+
+Requirements.txt:
+{req_content or "(not found)"}
+
+Project structure:
+{chr(10).join(tree_lines[:80])}
+"""
+
+        user_msg = f"""DEPLOYMENT FAILED. Analyze and fix it completely.
+
+=== DEPLOYMENT LOGS (last 200 lines) ===
+{log_tail[-8000:]}
+=== END LOGS ===
+
+Start by identifying the exact error. Then fix it. You have full control — go."""
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_msg},
+        ]
+
+        restart_ctx: Dict = {}
+        done = False
+
+        for round_num in range(1, AI_MAX_ROUNDS + 1):
+            await _ai_log(deployment_id, project_id,
+                f"🤖 ─── Round {round_num}/{AI_MAX_ROUNDS} ───")
+
+            assistant_msg = await _ai_call_openrouter(messages, _AI_TOOLS)
+
+            if assistant_msg is None:
+                await _ai_log(deployment_id, project_id,
+                    "🤖 All AI models failed to respond", "error")
+                break
+
+            messages.append(assistant_msg)
+
+            # If AI responded with only text (no tool calls), log it and continue
+            tool_calls = assistant_msg.get("tool_calls") or []
+            if not tool_calls:
+                text = (assistant_msg.get("content") or "").strip()
+                if text:
+                    await _ai_log(deployment_id, project_id,
+                        f"🤖 AI: {text[:600]}")
+                # If AI gave text without tools, it's done thinking — prompt it to act
+                if round_num < AI_MAX_ROUNDS:
+                    messages.append({
+                        "role": "user",
+                        "content": "Continue. Use your tools to implement the fix now.",
+                    })
+                continue
+
+            # Execute all tool calls in this response
+            tool_results = []
+            for tc in tool_calls:
+                fn        = tc.get("function", {})
+                tool_name = fn.get("name", "")
+                try:
+                    args = json.loads(fn.get("arguments", "{}"))
+                except Exception:
+                    args = {}
+
+                result = await _ai_exec_tool(
+                    tool_name, args,
+                    project_dir, deployment_id, project_id,
+                    restart_ctx,
+                )
+
+                tool_results.append({
+                    "role": "tool",
+                    "tool_call_id": tc.get("id", ""),
+                    "content": result[:8000],
+                })
+
+                if tool_name == "mark_fixed":
+                    done = True
+
+            messages.extend(tool_results)
+
+            if done:
+                success = restart_ctx.get("restarted", False)
+                await _ai_log(deployment_id, project_id,
+                    "🤖 ═══ AI AGENT SESSION COMPLETE ═══" +
+                    (" ✅" if success else " ⚠️ (check logs)"))
+                break
+
+            await asyncio.sleep(0.3)
+
+        else:
+            await _ai_log(deployment_id, project_id,
+                f"🤖 Reached max rounds ({AI_MAX_ROUNDS}) — stopping", "warning")
+
+    except Exception as e:
+        logger.error(f"AI agent exception: {traceback.format_exc()}")
+        await db_add_log(deployment_id, project_id,
+            f"🤖 Agent error: {e}", level="error", source="ai")
+    finally:
+        _ai_fixing.pop(deployment_id, None)
+
+
 # SECTION 12: HTML UI TEMPLATES
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -1480,6 +2383,7 @@ def _base_html(title: str, body: str, extra_head: str = "") -> str:
     .log-warning {{ color: #ffb300; }}
     .log-success {{ color: #00ff88; }}
     .log-build   {{ color: #00cfff; }}
+    .log-ai      {{ color: #c084fc; }}
     
     .upload-zone {{
       border: 2px dashed var(--border); border-radius: 12px;
@@ -2102,9 +3006,13 @@ def render_logs_page(user: Dict, deployment: Dict, logs: List[Dict], project: Di
         </div>
         <div class="mono" style="font-size:12px;color:var(--muted);margin-top:4px;">{deployment_id}</div>
       </div>
-      <div style="display:flex;gap:8px;">
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
         <button onclick="downloadLogs()" class="btn-secondary" style="padding:9px 16px;border-radius:7px;font-size:13px;">↓ Download</button>
-        <button onclick="toggleAutoRefresh()" id="refreshBtn" class="btn-secondary" style="padding:9px 16px;border-radius:7px;font-size:13px;">⟳ Auto-refresh: OFF</button>
+        <button onclick="toggleAutoRefresh()" id="refreshBtn" class="btn-secondary" style="padding:9px 16px;border-radius:7px;font-size:13px;">⟳ Live</button>
+        <button onclick="triggerAiFix()" id="aiFixBtn"
+          style="padding:9px 16px;border-radius:7px;font-size:13px;background:linear-gradient(135deg,#7c3aed,#c084fc);color:#fff;border:none;cursor:pointer;font-weight:700;">
+          🤖 AI Fix
+        </button>
       </div>
     </div>
     
@@ -2113,6 +3021,7 @@ def render_logs_page(user: Dict, deployment: Dict, logs: List[Dict], project: Di
       <button class="btn-secondary filter-btn" data-filter="error" onclick="filterLogs('error')" style="padding:5px 14px;border-radius:5px;font-size:12px;color:#ff6b6b;">Errors</button>
       <button class="btn-secondary filter-btn" data-filter="build" onclick="filterLogs('build')" style="padding:5px 14px;border-radius:5px;font-size:12px;color:var(--brand2);">Build</button>
       <button class="btn-secondary filter-btn" data-filter="stdout" onclick="filterLogs('stdout')" style="padding:5px 14px;border-radius:5px;font-size:12px;">Stdout</button>
+      <button class="btn-secondary filter-btn" data-filter="ai" onclick="filterLogs('ai')" style="padding:5px 14px;border-radius:5px;font-size:12px;color:#c084fc;">🤖 AI</button>
     </div>
     
     <div class="log-container" id="logContainer">
@@ -2142,21 +3051,31 @@ function filterLogs(filter) {{
   renderLogs(allLogs);
 }}
 
+function logCls(l) {{
+  if (l.source === 'ai') return 'log-ai';
+  if (l.level === 'error') return 'log-error';
+  if (l.level === 'warning') return 'log-warning';
+  if (l.source === 'build' || l.source === 'pip') return 'log-build';
+  if (l.source === 'stderr') return 'log-error';
+  if ((l.message||'').match(/🚀|✅|success/i)) return 'log-success';
+  return 'log-info';
+}}
+
 function renderLogs(logs) {{
   const container = document.getElementById('logContainer');
-  const filtered = currentFilter === 'all' ? logs : logs.filter(l => l.source === currentFilter || l.level === currentFilter);
+  const filtered = currentFilter === 'all' ? logs :
+    logs.filter(l => l.source === currentFilter || l.level === currentFilter);
   let html = '';
   filtered.forEach(l => {{
-    const cls = l.level === 'error' ? 'log-error' : l.level === 'warning' ? 'log-warning' : l.source === 'build' || l.source === 'pip' ? 'log-build' : 'log-info';
+    const cls = logCls(l);
     const ts = (l.created_at||'').slice(0,19).replace('T',' ');
     const msg = (l.message||'').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-    html += `<div class="log-line ${{cls}}"><span style="color:var(--muted);user-select:none">${{ts}}  </span>${{msg}}</div>`;
+    html += `<div class="log-line ${{cls}}"><span style="color:var(--muted);user-select:none;font-size:11px;">${{ts}}  </span>${{msg}}</div>`;
   }});
   container.innerHTML = html || '<div class="log-line log-info">No logs for this filter.</div>';
   container.scrollTop = container.scrollHeight;
   document.getElementById('logCount').textContent = filtered.length + ' lines';
 }}
-
 async function refreshLogs() {{
   try {{
     const r = await fetch('/api/deployments/' + deploymentId + '/logs');
@@ -2188,8 +3107,27 @@ function downloadLogs() {{
   a.click();
 }}
 
-// Auto-scroll on load
+// Auto-scroll on load + auto-start live refresh
 document.getElementById('logContainer').scrollTop = document.getElementById('logContainer').scrollHeight;
+toggleAutoRefresh();
+
+async function triggerAiFix() {{
+  const btn = document.getElementById('aiFixBtn');
+  btn.textContent = '🤖 Starting...';
+  btn.disabled = true;
+  try {{
+    const r = await fetch('/api/deployments/' + deploymentId + '/ai-fix', {{method:'POST'}});
+    const data = await r.json();
+    if (r.ok) {{
+      btn.textContent = '🤖 AI Running…';
+    }} else {{
+      alert('AI Fix: ' + (data.detail || JSON.stringify(data)));
+      btn.textContent = '🤖 AI Fix'; btn.disabled = false;
+    }}
+  }} catch(e) {{
+    alert('Error: ' + e); btn.textContent = '🤖 AI Fix'; btn.disabled = false;
+  }}
+}}
 </script>"""
     return _base_html(f"Logs — {project_name}", body)
 
@@ -2590,6 +3528,31 @@ async def api_restart_deployment(
     )
 
     return JSONResponse({"success": True, "message": "Restarting deployment..."})
+
+
+@app.post("/api/deployments/{deployment_id}/ai-fix")
+async def api_ai_fix(request: Request, background_tasks: BackgroundTasks, deployment_id: str):
+    """Manually trigger the AI auto-fix agent for a deployment."""
+    user = await get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated.")
+
+    deployment = await db_get_deployment(deployment_id)
+    if not deployment:
+        raise HTTPException(status_code=404, detail="Deployment not found.")
+
+    project = await db_get_project(deployment["project_id"])
+    if not project or project.get("user_id") != user["id"]:
+        raise HTTPException(status_code=403, detail="Access denied.")
+
+    if not OPENROUTER_API_KEY:
+        raise HTTPException(status_code=400, detail="OPENROUTER_API_KEY not configured on this server.")
+
+    if _ai_fixing.get(deployment_id):
+        return JSONResponse({"status": "already_running", "message": "AI fix is already in progress."})
+
+    background_tasks.add_task(ai_auto_fix, deployment_id, deployment["project_id"], "manual")
+    return JSONResponse({"status": "started", "message": "AI auto-fix agent started."})
 
 
 @app.get("/api/health")
