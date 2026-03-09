@@ -90,14 +90,17 @@ PLATFORM_TITLE: str = "PyDeploy"
 # OpenRouter AI config (for auto-fix agent)
 OPENROUTER_API_KEY: str = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE: str = "https://openrouter.ai/api/v1/chat/completions"
-# Free models on OpenRouter (verified free tier, tried in order)
+# Free models on OpenRouter — verified March 2026, tried in order
+# First entry is "openrouter/free" — their magic router that auto-picks any
+# available free model that supports tool calling.  Best resilience.
 OPENROUTER_MODELS: List[str] = [
-    "deepseek/deepseek-chat-v3-0324:free",      # DeepSeek V3 — very capable, free
-    "google/gemma-3-27b-it:free",               # Google Gemma 3 27B
-    "meta-llama/llama-4-maverick:free",          # Llama 4 Maverick
-    "microsoft/phi-4-reasoning:free",            # Microsoft Phi-4
-    "qwen/qwen3-235b-a22b:free",                # Qwen3 235B MoE
-    "mistralai/mistral-7b-instruct:free",        # Mistral 7B fallback
+    "openrouter/auto",                               # Auto-route: best available free model
+    "meta-llama/llama-3.3-70b-instruct:free",        # Llama 3.3 70B — GPT-4 level
+    "mistralai/devstral-2512:free",                  # Devstral 2 — best free coding model
+    "google/gemini-2.0-flash-exp:free",              # Gemini 2.0 Flash — 1M context
+    "deepseek/deepseek-r1-0528:free",                # DeepSeek R1 — strong reasoning
+    "nvidia/nemotron-3-nano:free",                   # Nemotron Nano — agentic tasks
+    "mistralai/mistral-7b-instruct:free",            # Mistral 7B — small fast fallback
 ]
 AI_MAX_ROUNDS: int = 30        # max tool-call iterations per fix session
 AI_CMD_TIMEOUT: int = 180      # seconds per shell command
@@ -539,8 +542,11 @@ class FrameworkDetector:
     }
 
     ENTRY_PATTERNS = [
-        "main.py", "app.py", "server.py", "wsgi.py",
-        "asgi.py", "run.py", "application.py",
+        # Most common first
+        "main.py", "app.py", "server.py", "bot.py", "run.py",
+        "wsgi.py", "asgi.py", "application.py", "index.py",
+        "start.py", "manage.py", "api.py", "worker.py",
+        "__main__.py", "launcher.py", "handler.py",
     ]
 
     @classmethod
@@ -609,6 +615,28 @@ class FrameworkDetector:
                 if candidate.name in cls.ENTRY_PATTERNS:
                     entry = str(candidate.relative_to(root))
                     break
+
+        # If STILL not found, look for ANY .py with __main__ guard
+        if not entry:
+            skip = {".venv", "node_modules", "__pycache__"}
+            for candidate in sorted(root.rglob("*.py")):
+                if any(part in skip for part in candidate.parts):
+                    continue
+                try:
+                    text = candidate.read_text(errors="replace")
+                    if '__name__' in text and '__main__' in text:
+                        entry = str(candidate.relative_to(root))
+                        result["notes"].append(f"Entry point found via __main__ scan: {entry}")
+                        break
+                except Exception:
+                    pass
+
+        # Last resort: pick the first .py file at root level
+        if not entry:
+            candidates = sorted(root.glob("*.py"))
+            if candidates:
+                entry = str(candidates[0].relative_to(root))
+                result["notes"].append(f"Entry point fallback: first .py file = {entry}")
 
         result["entry_point"] = entry
 
@@ -1472,6 +1500,7 @@ async def _ai_call_openrouter(messages: List[Dict], tools: List[Dict]) -> Option
 
     for model in OPENROUTER_MODELS:
         try:
+            # openrouter/auto routes to best available free model dynamically
             payload = {
                 "model": model,
                 "messages": messages,
@@ -1480,6 +1509,9 @@ async def _ai_call_openrouter(messages: List[Dict], tools: List[Dict]) -> Option
                 "max_tokens": 4096,
                 "temperature": 0.15,
             }
+            # Some models don't support tool_choice param — remove for safety
+            if model in ("openrouter/auto",):
+                payload.pop("tool_choice", None)
             async with httpx.AsyncClient(timeout=httpx.Timeout(90.0)) as client:
                 resp = await client.post(OPENROUTER_BASE, json=payload, headers=headers)
 
@@ -1678,6 +1710,28 @@ _AI_TOOLS = [
             "name": "get_env",
             "description": "Show environment variables and Python/system info available to the app.",
             "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_startup_cmd",
+            "description": (
+                "Update the startup command in the database. "
+                "Use this when the detected startup command is wrong "
+                "(e.g. references main.py but the real file is bot.py). "
+                "Call this BEFORE restart_app so the new command is used."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "startup_cmd": {
+                        "type": "string",
+                        "description": "The correct startup command, e.g. 'python bot.py' or 'uvicorn app:app --host 0.0.0.0 --port $PORT'",
+                    },
+                },
+                "required": ["startup_cmd"],
+            },
         },
     },
     {
@@ -2025,6 +2079,20 @@ async def _ai_exec_tool(
         await _ai_log(deployment_id, project_id, "   🌍 Got environment info")
         return result[:8000]
 
+    # ── set_startup_cmd ──────────────────────────────────────────────────────
+    elif tool_name == "set_startup_cmd":
+        new_cmd = tool_args.get("startup_cmd", "").strip()
+        if not new_cmd:
+            return "[ERROR]: startup_cmd cannot be empty"
+        try:
+            await db_update_project(project_id, {"startup_cmd": new_cmd})
+            await db_update_deployment(deployment_id, {"startup_cmd": new_cmd})
+            await _ai_log(deployment_id, project_id,
+                f"   🔄 Startup command updated → {new_cmd}")
+            return f"OK — startup_cmd set to: {new_cmd}"
+        except Exception as e:
+            return f"[ERROR]: {e}"
+
     # ── restart_app ──────────────────────────────────────────────────────────
     elif tool_name == "restart_app":
         try:
@@ -2180,7 +2248,18 @@ RULES:
 - Fix port binding: ensure app binds to 0.0.0.0 and uses the PORT env var
 - Fix import errors: check requirements.txt and install missing packages
 - Fix syntax errors: read the file, find the bug, patch it
-- If startup_cmd is wrong, fix it: update the file or run_command to test correct cmd
+
+CRITICAL — STARTUP COMMAND ERRORS:
+- "can't open file .../main.py: No such file or directory" means the startup command
+  references the WRONG file. Use list_files to see what .py files actually exist,
+  then figure out the correct entry point, then fix the startup_cmd in the DB by
+  running: `echo "correct_cmd" > /tmp/startup_fix.txt` and calling restart_app
+  (restart_app reads startup_cmd from the DB — you must update it FIRST via run_command:
+   use sqlite or update the project's startup_cmd field if possible, OR just rename/copy
+   the correct entry file to match the expected name)
+- EASIEST FIX for wrong filename: if bot.py exists but cmd says "python main.py",
+  just copy/rename: run_command "cp bot.py main.py" or rename_file bot.py → main.py
+
 - NEVER give up without trying multiple approaches
 - Be concise in mark_fixed summary but specific about what was changed
 
