@@ -3049,7 +3049,220 @@ def render_upload_page(user: Dict, error: str = "", success: str = "") -> str:
       </div>
     </div>
     
-    <div style="margin-top: 28px;" class="card" style="padding:20px;">
+
+    <!-- ═══════════════════════════════════════════════════════════ -->
+    <!-- REQUIREMENTS BOX                                           -->
+    <!-- ═══════════════════════════════════════════════════════════ -->
+    <div style="margin-top:32px; border:1.5px solid #7c3aed55; border-radius:14px; overflow:hidden; background: linear-gradient(135deg, #0d0a1a 0%, #0a0f18 100%);">
+
+      <!-- Header -->
+      <div style="display:flex;align-items:center;gap:12px;padding:18px 24px;background:linear-gradient(135deg,#7c3aed22,#06b6d422);border-bottom:1px solid #7c3aed33;">
+        <span style="font-size:22px;">📋</span>
+        <div>
+          <div style="font-size:15px;font-weight:800;color:#e2d9ff;letter-spacing:.3px;">Deployment Requirements</div>
+          <div style="font-size:12px;color:#9b8ec4;margin-top:2px;">Follow these to deploy with zero warnings or errors</div>
+        </div>
+        <div style="margin-left:auto;">
+          <span style="font-size:11px;font-weight:700;background:#7c3aed33;color:#c084fc;padding:4px 10px;border-radius:20px;letter-spacing:.5px;">READ BEFORE UPLOADING</span>
+        </div>
+      </div>
+
+      <div style="padding:24px;display:grid;gap:20px;">
+
+        <!-- 1. File structure -->
+        <div style="background:#ffffff07;border-radius:10px;padding:18px 20px;border-left:3px solid #00cfff;">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;">
+            <span style="font-size:16px;">📁</span>
+            <span style="font-weight:800;color:#00cfff;font-size:14px;">1. ZIP Structure</span>
+          </div>
+          <div style="font-size:13px;color:#cbd5e1;line-height:1.8;">
+            • Put your files <strong style="color:#fff;">directly in the ZIP root</strong> (not inside a subfolder)<br>
+            • OR one top-level folder is fine — we flatten it automatically<br>
+            • Required: at least one Python entry file (<code style="color:#00cfff;background:#ffffff11;padding:1px 5px;border-radius:3px;">app.py</code>, <code style="color:#00cfff;background:#ffffff11;padding:1px 5px;border-radius:3px;">main.py</code>, <code style="color:#00cfff;background:#ffffff11;padding:1px 5px;border-radius:3px;">bot.py</code>, <code style="color:#00cfff;background:#ffffff11;padding:1px 5px;border-radius:3px;">server.py</code>, etc.)<br>
+            • Max ZIP size: <strong style="color:#fff;">{MAX_ZIP_SIZE_MB} MB</strong> · Max unzipped: <strong style="color:#fff;">{MAX_UNZIPPED_SIZE_MB} MB</strong><br>
+            • <strong style="color:#ff6b6b;">Never include</strong> <code style="color:#ff6b6b;background:#ffffff11;padding:1px 5px;border-radius:3px;">.venv/</code>, <code style="color:#ff6b6b;background:#ffffff11;padding:1px 5px;border-radius:3px;">node_modules/</code>, <code style="color:#ff6b6b;background:#ffffff11;padding:1px 5px;border-radius:3px;">__pycache__/</code> — they bloat your ZIP
+          </div>
+          <div style="margin-top:12px;background:#000000aa;border-radius:6px;padding:10px 14px;font-family:'Space Mono',monospace;font-size:11px;color:#64748b;line-height:1.7;">
+            <span style="color:#00ff88;">✓</span>  my-project.zip<br>
+            <span style="color:#64748b;">  ├── app.py</span>          <span style="color:#00ff88;">← entry point</span><br>
+            <span style="color:#64748b;">  ├── requirements.txt</span>  <span style="color:#00ff88;">← dependencies</span><br>
+            <span style="color:#64748b;">  ├── .env.example</span>     <span style="color:#facc15;">← env var template (not .env!)</span><br>
+            <span style="color:#64748b;">  └── utils/</span>            <span style="color:#64748b;">← any sub-folders OK</span>
+          </div>
+        </div>
+
+        <!-- 2. requirements.txt -->
+        <div style="background:#ffffff07;border-radius:10px;padding:18px 20px;border-left:3px solid #00ff88;">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;">
+            <span style="font-size:16px;">📦</span>
+            <span style="font-weight:800;color:#00ff88;font-size:14px;">2. Dependencies — requirements.txt</span>
+          </div>
+          <div style="font-size:13px;color:#cbd5e1;line-height:1.8;">
+            • <strong style="color:#fff;">Must exist</strong> at the root — we run <code style="color:#00ff88;background:#ffffff11;padding:1px 5px;border-radius:3px;">pip install -r requirements.txt</code> automatically<br>
+            • Pin your versions for reproducibility: <code style="color:#00ff88;background:#ffffff11;padding:1px 5px;border-radius:3px;">fastapi==0.115.0</code><br>
+            • Include your web server: <code style="color:#00ff88;background:#ffffff11;padding:1px 5px;border-radius:3px;">uvicorn[standard]</code> for FastAPI/Starlette, <code style="color:#00ff88;background:#ffffff11;padding:1px 5px;border-radius:3px;">gunicorn</code> for Flask/Django<br>
+            • <strong style="color:#ff6b6b;">Do NOT</strong> include system packages (apt-get stuff) — Python packages only<br>
+            • Missing package? Our AI agent will detect and install it automatically
+          </div>
+          <div style="margin-top:12px;background:#000000aa;border-radius:6px;padding:10px 14px;font-family:'Space Mono',monospace;font-size:11px;color:#64748b;line-height:1.7;">
+            <span style="color:#64748b;"># requirements.txt example</span><br>
+            fastapi==0.115.0<br>
+            uvicorn[standard]==0.30.0<br>
+            python-dotenv==1.0.0<br>
+            httpx==0.27.0
+          </div>
+        </div>
+
+        <!-- 3. Port binding -->
+        <div style="background:#ffffff07;border-radius:10px;padding:18px 20px;border-left:3px solid #facc15;">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;">
+            <span style="font-size:16px;">🔌</span>
+            <span style="font-weight:800;color:#facc15;font-size:14px;">3. Port Binding — Critical!</span>
+            <span style="font-size:10px;font-weight:700;background:#facc1533;color:#facc15;padding:2px 7px;border-radius:10px;margin-left:4px;">MOST COMMON FAILURE</span>
+          </div>
+          <div style="font-size:13px;color:#cbd5e1;line-height:1.8;">
+            • Your app <strong style="color:#fff;">MUST</strong> read the port from the <code style="color:#facc15;background:#ffffff11;padding:1px 5px;border-radius:3px;">PORT</code> environment variable<br>
+            • Bind to <code style="color:#facc15;background:#ffffff11;padding:1px 5px;border-radius:3px;">0.0.0.0</code> (not localhost or 127.0.0.1 — those won't be reachable)<br>
+            • We inject <code style="color:#facc15;background:#ffffff11;padding:1px 5px;border-radius:3px;">PORT</code> automatically — just read <code style="color:#facc15;background:#ffffff11;padding:1px 5px;border-radius:3px;">os.environ["PORT"]</code>
+          </div>
+          <div style="margin-top:12px;display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+            <div style="background:#ff3b3b11;border:1px solid #ff3b3b33;border-radius:6px;padding:10px 12px;font-family:'Space Mono',monospace;font-size:11px;line-height:1.7;">
+              <div style="color:#ff6b6b;font-weight:700;margin-bottom:4px;">❌ Wrong</div>
+              <span style="color:#64748b;">uvicorn app:app<br>  --port 8000<br>  --host 127.0.0.1</span>
+            </div>
+            <div style="background:#00ff8811;border:1px solid #00ff8833;border-radius:6px;padding:10px 12px;font-family:'Space Mono',monospace;font-size:11px;line-height:1.7;">
+              <div style="color:#00ff88;font-weight:700;margin-bottom:4px;">✓ Correct</div>
+              <span style="color:#64748b;">port = int(os.environ<br>  .get("PORT", 8000))<br>uvicorn app:app<br>  --host 0.0.0.0<br>  --port $PORT</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- 4. Environment variables -->
+        <div style="background:#ffffff07;border-radius:10px;padding:18px 20px;border-left:3px solid #f472b6;">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;">
+            <span style="font-size:16px;">🔑</span>
+            <span style="font-weight:800;color:#f472b6;font-size:14px;">4. Secrets &amp; Environment Variables</span>
+          </div>
+          <div style="font-size:13px;color:#cbd5e1;line-height:1.8;">
+            • <strong style="color:#fff;">Never commit</strong> <code style="color:#f472b6;background:#ffffff11;padding:1px 5px;border-radius:3px;">.env</code> files — add them in the <strong>Env Vars</strong> section below before deploying<br>
+            • Telegram bots need: <code style="color:#f472b6;background:#ffffff11;padding:1px 5px;border-radius:3px;">TELEGRAM_BOT_TOKEN</code><br>
+            • Discord bots need: <code style="color:#f472b6;background:#ffffff11;padding:1px 5px;border-radius:3px;">DISCORD_TOKEN</code><br>
+            • OpenAI apps need: <code style="color:#f472b6;background:#ffffff11;padding:1px 5px;border-radius:3px;">OPENAI_API_KEY</code><br>
+            • Database apps need: <code style="color:#f472b6;background:#ffffff11;padding:1px 5px;border-radius:3px;">DATABASE_URL</code> or similar<br>
+            • Your code should handle missing vars gracefully: use <code style="color:#f472b6;background:#ffffff11;padding:1px 5px;border-radius:3px;">os.getenv("KEY", "")</code> not <code style="color:#ff6b6b;background:#ffffff11;padding:1px 5px;border-radius:3px;">os.environ["KEY"]</code>
+          </div>
+        </div>
+
+        <!-- 5. Framework specifics -->
+        <div style="background:#ffffff07;border-radius:10px;padding:18px 20px;border-left:3px solid #818cf8;">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;">
+            <span style="font-size:16px;">⚙️</span>
+            <span style="font-weight:800;color:#818cf8;font-size:14px;">5. Framework-Specific Requirements</span>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;font-size:12px;">
+            <div style="background:#ffffff05;border-radius:8px;padding:12px;">
+              <div style="color:#00cfff;font-weight:700;margin-bottom:8px;">FastAPI / Starlette</div>
+              <div style="color:#94a3b8;line-height:1.8;">
+                • <code style="color:#00cfff;">uvicorn[standard]</code> in requirements<br>
+                • Entry: <code style="color:#00cfff;">app = FastAPI()</code><br>
+                • Cmd: <code style="color:#00cfff;">uvicorn app:app --host 0.0.0.0 --port $PORT</code>
+              </div>
+            </div>
+            <div style="background:#ffffff05;border-radius:8px;padding:12px;">
+              <div style="color:#f97316;font-weight:700;margin-bottom:8px;">Flask</div>
+              <div style="color:#94a3b8;line-height:1.8;">
+                • <code style="color:#f97316;">gunicorn</code> or <code style="color:#f97316;">flask</code> in requirements<br>
+                • Entry: <code style="color:#f97316;">app = Flask(__name__)</code><br>
+                • Cmd: <code style="color:#f97316;">gunicorn app:app --bind 0.0.0.0:$PORT</code>
+              </div>
+            </div>
+            <div style="background:#ffffff05;border-radius:8px;padding:12px;">
+              <div style="color:#10b981;font-weight:700;margin-bottom:8px;">Django</div>
+              <div style="color:#94a3b8;line-height:1.8;">
+                • <code style="color:#10b981;">gunicorn</code> + <code style="color:#10b981;">django</code> in requirements<br>
+                • Must have <code style="color:#10b981;">wsgi.py</code> or <code style="color:#10b981;">asgi.py</code><br>
+                • Set <code style="color:#10b981;">DJANGO_SETTINGS_MODULE</code> env var
+              </div>
+            </div>
+            <div style="background:#ffffff05;border-radius:8px;padding:12px;">
+              <div style="color:#a78bfa;font-weight:700;margin-bottom:8px;">Telegram / Discord Bots</div>
+              <div style="color:#94a3b8;line-height:1.8;">
+                • <code style="color:#a78bfa;">python-telegram-bot</code> or <code style="color:#a78bfa;">discord.py</code><br>
+                • Token in Env Vars before deploy<br>
+                • Entry: <code style="color:#a78bfa;">bot.py</code> or <code style="color:#a78bfa;">main.py</code> with polling loop
+              </div>
+            </div>
+            <div style="background:#ffffff05;border-radius:8px;padding:12px;">
+              <div style="color:#fb923c;font-weight:700;margin-bottom:8px;">Scripts / Workers</div>
+              <div style="color:#94a3b8;line-height:1.8;">
+                • Must run <strong>indefinitely</strong> (loop or blocking call)<br>
+                • Scripts that exit immediately = unhealthy<br>
+                • Use <code style="color:#fb923c;">while True: time.sleep()</code> or event loop
+              </div>
+            </div>
+            <div style="background:#ffffff05;border-radius:8px;padding:12px;">
+              <div style="color:#34d399;font-weight:700;margin-bottom:8px;">React / Next.js Frontend</div>
+              <div style="color:#94a3b8;line-height:1.8;">
+                • Include <code style="color:#34d399;">package.json</code> with build script<br>
+                • Backend must serve built files<br>
+                • Or use separate backend + static dir
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 6. Common errors -->
+        <div style="background:#ff3b3b0a;border:1px solid #ff3b3b22;border-radius:10px;padding:18px 20px;">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;">
+            <span style="font-size:16px;">🚨</span>
+            <span style="font-weight:800;color:#ff6b6b;font-size:14px;">6. Common Errors &amp; How to Fix Them</span>
+          </div>
+          <div style="display:grid;gap:8px;font-size:12px;">
+            <div style="display:flex;gap:12px;align-items:flex-start;padding:8px 0;border-bottom:1px solid #ffffff0a;">
+              <code style="color:#ff6b6b;background:#ff3b3b11;padding:2px 7px;border-radius:4px;white-space:nowrap;flex-shrink:0;">ModuleNotFoundError</code>
+              <span style="color:#94a3b8;">Package not in requirements.txt — add it. Our AI will also try to install it automatically.</span>
+            </div>
+            <div style="display:flex;gap:12px;align-items:flex-start;padding:8px 0;border-bottom:1px solid #ffffff0a;">
+              <code style="color:#ff6b6b;background:#ff3b3b11;padding:2px 7px;border-radius:4px;white-space:nowrap;flex-shrink:0;">ValueError: X is not set</code>
+              <span style="color:#94a3b8;">Missing environment variable — add it in the Env Vars section below.</span>
+            </div>
+            <div style="display:flex;gap:12px;align-items:flex-start;padding:8px 0;border-bottom:1px solid #ffffff0a;">
+              <code style="color:#ff6b6b;background:#ff3b3b11;padding:2px 7px;border-radius:4px;white-space:nowrap;flex-shrink:0;">No such file: main.py</code>
+              <span style="color:#94a3b8;">Your entry file has a different name. Our AI detects and fixes this automatically.</span>
+            </div>
+            <div style="display:flex;gap:12px;align-items:flex-start;padding:8px 0;border-bottom:1px solid #ffffff0a;">
+              <code style="color:#ff6b6b;background:#ff3b3b11;padding:2px 7px;border-radius:4px;white-space:nowrap;flex-shrink:0;">Connection refused</code>
+              <span style="color:#94a3b8;">App not binding to 0.0.0.0 or not using PORT env var. Fix in your server config.</span>
+            </div>
+            <div style="display:flex;gap:12px;align-items:flex-start;padding:8px 0;border-bottom:1px solid #ffffff0a;">
+              <code style="color:#ff6b6b;background:#ff3b3b11;padding:2px 7px;border-radius:4px;white-space:nowrap;flex-shrink:0;">Process exited code 1</code>
+              <span style="color:#94a3b8;">App crashed at startup. Check the logs — our AI agent will auto-diagnose and fix.</span>
+            </div>
+            <div style="display:flex;gap:12px;align-items:flex-start;padding:8px 0;">
+              <code style="color:#ff6b6b;background:#ff3b3b11;padding:2px 7px;border-radius:4px;white-space:nowrap;flex-shrink:0;">SyntaxError</code>
+              <span style="color:#94a3b8;">Python version mismatch or typo. Our AI will read the file and patch the bug.</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- AI auto-fix notice -->
+        <div style="background:linear-gradient(135deg,#7c3aed15,#06b6d415);border:1px solid #7c3aed33;border-radius:10px;padding:16px 20px;display:flex;gap:14px;align-items:flex-start;">
+          <span style="font-size:24px;flex-shrink:0;">🤖</span>
+          <div>
+            <div style="font-weight:800;color:#c084fc;font-size:13px;margin-bottom:6px;">AI Auto-Fix Agent (Gemini 3.1 Pro)</div>
+            <div style="font-size:12px;color:#94a3b8;line-height:1.8;">
+              If your deployment fails, our AI agent automatically diagnoses and fixes the problem — 
+              wrong startup command, missing packages, port binding issues, syntax errors, and more. 
+              It has full control over your project files and can install packages, edit code, 
+              and restart the app. <strong style="color:#c084fc;">You just need to set your env vars.</strong>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+    <div style="margin-top: 20px;" class="card" style="padding:20px;">
       <div style="padding:20px;">
         <h3 style="margin:0 0 12px; font-size:14px; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:.8px;">Supported Frameworks</h3>
         <div style="display:flex; flex-wrap:wrap; gap:8px;">
@@ -3090,14 +3303,32 @@ document.getElementById('projectName').addEventListener('input', function() {{
 
 function addEnvVar() {{
   const c = document.getElementById('envVarsContainer');
+  if (!c.querySelector('[data-envrow]') && c.children.length === 0) {{
+    c.innerHTML = '';  // clear placeholder
+  }}
   const row = document.createElement('div');
-  row.style.cssText = 'display:flex;gap:8px;margin-bottom:8px;';
+  row.setAttribute('data-envrow', '');
+  row.style.cssText = 'display:flex;gap:8px;margin-bottom:8px;align-items:center;';
   row.innerHTML = `
-    <input class="form-input" type="text" placeholder="KEY" style="width:40%">
-    <input class="form-input" type="text" placeholder="value" style="flex:1">
-    <button type="button" class="btn-danger" onclick="this.parentNode.remove()" style="padding:8px 12px;border-radius:6px;font-size:13px;">✕</button>
+    <input class="form-input" type="text" placeholder="KEY"
+           style="width:35%;font-family:'Space Mono',monospace;font-size:12px;" data-key-input>
+    <div style="flex:1;position:relative;">
+      <input class="form-input" type="password" placeholder="value"
+             style="width:100%;font-family:'Space Mono',monospace;font-size:12px;padding-right:36px;" data-val-input>
+      <button type="button" onclick="toggleEnvReveal(this)"
+              style="position:absolute;right:8px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--muted);cursor:pointer;font-size:14px;padding:0;">👁</button>
+    </div>
+    <button type="button" onclick="this.closest('[data-envrow]').remove()"
+            style="background:#ff3b3b22;border:1px solid #ff3b3b44;color:#ff6b6b;border-radius:6px;padding:7px 11px;cursor:pointer;font-size:13px;">✕</button>
   `;
   c.appendChild(row);
+  row.querySelector('[data-key-input]').focus();
+}}
+
+function toggleEnvReveal(btn) {{
+  const inp = btn.previousElementSibling;
+  inp.type = inp.type === 'password' ? 'text' : 'password';
+  btn.textContent = inp.type === 'password' ? '👁' : '🙈';
 }}
 
 async function submitDeployment() {{
@@ -3107,9 +3338,10 @@ async function submitDeployment() {{
   
   // Collect env vars
   const envVars = {{}};
-  document.querySelectorAll('#envVarsContainer > div').forEach(row => {{
-    const inputs = row.querySelectorAll('input');
-    if (inputs[0].value.trim()) envVars[inputs[0].value.trim()] = inputs[1].value;
+  document.querySelectorAll('#envVarsContainer [data-envrow]').forEach(row => {{
+    const k = (row.querySelector('[data-key-input]').value || '').trim();
+    const v = row.querySelector('[data-val-input]').value;
+    if (k) envVars[k] = v;
   }});
   
   const fd = new FormData();
@@ -3257,6 +3489,59 @@ def render_project_page(user: Dict, project: Dict, deployments: List[Dict]) -> s
       </div>
     </div>
     
+    <!-- ENV VARS PANEL -->
+    <div class="card" style="padding:0;overflow:hidden;margin-bottom:24px;">
+      <div style="padding:18px 24px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:12px;">
+        <span style="font-size:18px;">🔑</span>
+        <div style="flex:1;">
+          <h3 style="margin:0;font-size:15px;font-weight:700;">Environment Variables</h3>
+          <p style="margin:2px 0 0;font-size:12px;color:var(--muted);">Changes take effect immediately — app restarts automatically</p>
+        </div>
+        <button onclick="scanAndDetectEnvVars()" class="btn-secondary"
+                style="padding:8px 14px;border-radius:7px;font-size:12px;display:flex;align-items:center;gap:6px;">
+          🔍 Detect from Code
+        </button>
+      </div>
+
+      <!-- Existing vars list -->
+      <div style="padding:20px 24px;" id="envVarsPanel">
+        <div id="envVarsList">
+          <!-- populated by JS -->
+        </div>
+        <button onclick="addProjectEnvVar()" class="btn-secondary"
+                style="padding:7px 14px;border-radius:6px;font-size:12px;margin-top:12px;">
+          + Add Variable
+        </button>
+        <button onclick="saveEnvVars()" id="saveEnvBtn"
+                class="btn-primary"
+                style="padding:7px 18px;border-radius:6px;font-size:12px;margin-top:12px;margin-left:10px;display:none;">
+          💾 Save & Restart
+        </button>
+        <span id="envSaveStatus" style="font-size:12px;color:var(--muted);margin-left:10px;"></span>
+      </div>
+
+      <!-- Detected missing vars box (hidden by default) -->
+      <div id="detectedEnvBox" style="display:none;margin:0 24px 20px;border:1.5px solid #f472b633;border-radius:10px;overflow:hidden;background:#0d0a18;">
+        <div style="background:linear-gradient(135deg,#f472b622,#7c3aed22);padding:14px 18px;display:flex;align-items:center;gap:10px;border-bottom:1px solid #f472b633;">
+          <span style="font-size:18px;">🤖</span>
+          <div>
+            <div style="font-weight:700;color:#f472b6;font-size:13px;">Missing Environment Variables Detected</div>
+            <div style="font-size:11px;color:#9b8ec4;margin-top:2px;">Your code references these vars but they're not set. Fill them in and click Apply.</div>
+          </div>
+          <button onclick="document.getElementById('detectedEnvBox').style.display='none'"
+                  style="margin-left:auto;background:none;border:none;color:#9b8ec4;cursor:pointer;font-size:18px;padding:0;">×</button>
+        </div>
+        <div style="padding:16px 18px;" id="detectedVarsList"></div>
+        <div style="padding:0 18px 16px;display:flex;align-items:center;gap:10px;">
+          <button onclick="applyDetectedVars()" id="applyDetectedBtn"
+                  style="background:linear-gradient(135deg,#7c3aed,#f472b6);border:none;color:#fff;font-weight:700;padding:9px 22px;border-radius:7px;cursor:pointer;font-size:13px;">
+            ✅ Apply & Restart
+          </button>
+          <span id="applyStatus" style="font-size:12px;color:var(--muted);"></span>
+        </div>
+      </div>
+    </div>
+
     <div class="card" style="padding:0; overflow:hidden;">
       <div style="padding:20px 24px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;">
         <h3 style="margin:0;font-size:15px;font-weight:700;">Deployment History</h3>
@@ -3269,6 +3554,248 @@ def render_project_page(user: Dict, project: Dict, deployments: List[Dict]) -> s
 
 <script>
 const projectId = '{pid}';
+// Existing env vars from DB
+let _currentEnvVars = {json.dumps(project.get("env_vars") or {})};
+let _dirty = false;
+
+// ── Render current env vars ─────────────────────────────────────────────────
+function renderEnvVars() {{
+  const list = document.getElementById('envVarsList');
+  const entries = Object.entries(_currentEnvVars);
+  if (!entries.length) {{
+    list.innerHTML = '<div style="font-size:13px;color:var(--muted);padding:8px 0;">No environment variables set yet.</div>';
+    return;
+  }}
+  list.innerHTML = entries.map(([k, v]) => `
+    <div style="display:flex;gap:8px;margin-bottom:8px;align-items:center;" data-envrow>
+      <input class="form-input mono-input" value="${{k}}" placeholder="KEY"
+             style="width:35%;font-family:'Space Mono',monospace;font-size:12px;"
+             oninput="markEnvDirty()" data-key-input>
+      <div style="flex:1;position:relative;">
+        <input class="form-input mono-input" value="${{v}}" placeholder="value" type="password"
+               style="width:100%;font-family:'Space Mono',monospace;font-size:12px;padding-right:36px;"
+               oninput="markEnvDirty()" data-val-input>
+        <button type="button" onclick="toggleReveal(this)"
+                style="position:absolute;right:8px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--muted);cursor:pointer;font-size:14px;padding:0;" title="Show/hide">👁</button>
+      </div>
+      <button type="button" onclick="removeEnvRow(this)"
+              style="background:#ff3b3b22;border:1px solid #ff3b3b44;color:#ff6b6b;border-radius:6px;padding:6px 10px;cursor:pointer;font-size:13px;">✕</button>
+    </div>
+  `).join('');
+}}
+
+function toggleReveal(btn) {{
+  const inp = btn.previousElementSibling;
+  inp.type = inp.type === 'password' ? 'text' : 'password';
+  btn.textContent = inp.type === 'password' ? '👁' : '🙈';
+}}
+
+function markEnvDirty() {{
+  _dirty = true;
+  document.getElementById('saveEnvBtn').style.display = 'inline-flex';
+}}
+
+function removeEnvRow(btn) {{
+  btn.closest('[data-envrow]').remove();
+  markEnvDirty();
+}}
+
+function addProjectEnvVar() {{
+  const list = document.getElementById('envVarsList');
+  // Clear "no vars" message if present
+  if (list.querySelector(':not([data-envrow])')) list.innerHTML = '';
+  const row = document.createElement('div');
+  row.setAttribute('data-envrow', '');
+  row.style.cssText = 'display:flex;gap:8px;margin-bottom:8px;align-items:center;';
+  row.innerHTML = `
+    <input class="form-input mono-input" placeholder="KEY"
+           style="width:35%;font-family:'Space Mono',monospace;font-size:12px;"
+           oninput="markEnvDirty()" data-key-input>
+    <div style="flex:1;position:relative;">
+      <input class="form-input mono-input" placeholder="value" type="password"
+             style="width:100%;font-family:'Space Mono',monospace;font-size:12px;padding-right:36px;"
+             oninput="markEnvDirty()" data-val-input>
+      <button type="button" onclick="toggleReveal(this)"
+              style="position:absolute;right:8px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--muted);cursor:pointer;font-size:14px;padding:0;">👁</button>
+    </div>
+    <button type="button" onclick="removeEnvRow(this)"
+            style="background:#ff3b3b22;border:1px solid #ff3b3b44;color:#ff6b6b;border-radius:6px;padding:6px 10px;cursor:pointer;font-size:13px;">✕</button>
+  `;
+  list.appendChild(row);
+  row.querySelector('[data-key-input]').focus();
+  markEnvDirty();
+}}
+
+function collectEnvRows() {{
+  const vars = {{}};
+  document.querySelectorAll('[data-envrow]').forEach(row => {{
+    const k = (row.querySelector('[data-key-input]').value || '').trim();
+    const v = row.querySelector('[data-val-input]').value;
+    if (k) vars[k] = v;
+  }});
+  return vars;
+}}
+
+async function saveEnvVars() {{
+  const btn = document.getElementById('saveEnvBtn');
+  const status = document.getElementById('envSaveStatus');
+  btn.disabled = true;
+  btn.textContent = 'Saving...';
+  status.textContent = '';
+  try {{
+    const vars = collectEnvRows();
+    const r = await fetch('/api/projects/' + projectId + '/env-vars', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{ env_vars: vars, restart: true }})
+    }});
+    const data = await r.json();
+    if (r.ok) {{
+      _currentEnvVars = vars;
+      status.textContent = '✅ Saved! App restarting…';
+      status.style.color = '#00ff88';
+      btn.style.display = 'none';
+      _dirty = false;
+      setTimeout(() => {{ status.textContent = ''; }}, 4000);
+    }} else {{
+      status.textContent = '❌ ' + (data.detail || 'Save failed');
+      status.style.color = '#ff6b6b';
+    }}
+  }} catch(e) {{
+    status.textContent = '❌ ' + e.message;
+    status.style.color = '#ff6b6b';
+  }}
+  btn.disabled = false;
+  btn.textContent = '💾 Save & Restart';
+}}
+
+// ── Detect env vars from code ────────────────────────────────────────────────
+async function scanAndDetectEnvVars() {{
+  const btn = event.target;
+  btn.disabled = true;
+  btn.textContent = '🔍 Scanning...';
+  try {{
+    const r = await fetch('/api/projects/' + projectId + '/scan-env');
+    const data = await r.json();
+    const allKeys = data.keys || [];
+    const existing = data.existing || {{}};
+    _currentEnvVars = existing;
+    renderEnvVars();
+
+    // Find missing = referenced in code but not set
+    const missing = allKeys.filter(k => !(k in existing) || existing[k] === '');
+
+    if (!missing.length) {{
+      btn.textContent = '✅ All set!';
+      setTimeout(() => {{ btn.disabled = false; btn.textContent = '🔍 Detect from Code'; }}, 2000);
+      return;
+    }}
+
+    // Show detected box
+    const box  = document.getElementById('detectedEnvBox');
+    const list = document.getElementById('detectedVarsList');
+    list.innerHTML = missing.map(k => `
+      <div style="display:flex;gap:8px;margin-bottom:8px;align-items:center;" data-detected-row data-key="${{k}}">
+        <div style="width:38%;font-family:'Space Mono',monospace;font-size:12px;color:#c084fc;font-weight:700;
+                    background:#ffffff08;padding:8px 10px;border-radius:6px;border:1px solid #7c3aed33;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"
+             title="${{k}}">${{k}}</div>
+        <div style="flex:1;position:relative;">
+          <input class="form-input" type="password" placeholder="Enter value…"
+                 style="width:100%;font-family:'Space Mono',monospace;font-size:12px;
+                        border-color:#7c3aed55;padding-right:36px;"
+                 data-detected-val>
+          <button type="button" onclick="toggleReveal(this)"
+                  style="position:absolute;right:8px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--muted);cursor:pointer;font-size:14px;padding:0;">👁</button>
+        </div>
+      </div>
+    `).join('');
+    box.style.display = 'block';
+    box.scrollIntoView({{behavior:'smooth', block:'nearest'}});
+    document.getElementById('applyStatus').textContent = '';
+  }} catch(e) {{
+    alert('Scan failed: ' + e.message);
+  }}
+  btn.disabled = false;
+  btn.textContent = '🔍 Detect from Code';
+}}
+
+async function applyDetectedVars() {{
+  const btn   = document.getElementById('applyDetectedBtn');
+  const status = document.getElementById('applyStatus');
+  btn.disabled = true;
+  btn.textContent = 'Applying...';
+  status.textContent = '';
+
+  const newVars = {{}};
+  let anyFilled = false;
+  document.querySelectorAll('[data-detected-row]').forEach(row => {{
+    const k = row.getAttribute('data-key');
+    const v = row.querySelector('[data-detected-val]').value;
+    if (v.trim()) {{ newVars[k] = v; anyFilled = true; }}
+  }});
+
+  if (!anyFilled) {{
+    status.textContent = '⚠️ Fill in at least one value';
+    status.style.color = '#facc15';
+    btn.disabled = false;
+    btn.textContent = '✅ Apply & Restart';
+    return;
+  }}
+
+  try {{
+    const r = await fetch('/api/projects/' + projectId + '/env-vars', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{ env_vars: newVars, restart: true }})
+    }});
+    const data = await r.json();
+    if (r.ok) {{
+      // Merge into current display
+      Object.assign(_currentEnvVars, newVars);
+      renderEnvVars();
+      status.textContent = `✅ ${{Object.keys(newVars).length}} var(s) saved — app restarting…`;
+      status.style.color = '#00ff88';
+      // Hide box after 3s
+      setTimeout(() => {{
+        document.getElementById('detectedEnvBox').style.display = 'none';
+      }}, 3000);
+    }} else {{
+      status.textContent = '❌ ' + (data.detail || 'Failed');
+      status.style.color = '#ff6b6b';
+    }}
+  }} catch(e) {{
+    status.textContent = '❌ ' + e.message;
+    status.style.color = '#ff6b6b';
+  }}
+  btn.disabled = false;
+  btn.textContent = '✅ Apply & Restart';
+}}
+
+// ── Warn on unsaved changes ──────────────────────────────────────────────────
+window.addEventListener('beforeunload', e => {{
+  if (_dirty) {{ e.preventDefault(); e.returnValue = ''; }}
+}});
+
+// ── Init ─────────────────────────────────────────────────────────────────────
+renderEnvVars();
+
+// Auto-scan for missing env vars on page load (only if project has deploy_dir)
+(async () => {{
+  try {{
+    const r = await fetch('/api/projects/' + projectId + '/scan-env');
+    const data = await r.json();
+    const allKeys = data.keys || [];
+    const existing = data.existing || {{}};
+    const missing = allKeys.filter(k => !(k in existing) || existing[k] === '');
+    if (missing.length) {{
+      // Show a gentle badge on the detect button
+      const btn = document.querySelector('button[onclick="scanAndDetectEnvVars()"]');
+      if (btn) {{
+        btn.innerHTML = `🔍 Detect from Code <span style="background:#f472b6;color:#fff;border-radius:10px;padding:1px 7px;font-size:11px;font-weight:700;margin-left:4px;">${{missing.length}} missing</span>`;
+      }}
+    }}
+  }} catch(e) {{}}
+}})();
 
 async function restartDeployment(deploymentId) {{
   if (!confirm('Restart this deployment?')) return;
@@ -3752,6 +4279,181 @@ async def api_get_project(request: Request, project_id: str):
         raise HTTPException(status_code=404, detail="Not found.")
 
     return JSONResponse(project)
+
+
+# ── ENV VAR SCANNER ─────────────────────────────────────────────────────────
+
+def scan_project_env_vars(project_dir: str) -> List[str]:
+    """
+    Scan all Python files + .env.example in the project directory and
+    extract every referenced environment variable key.
+    Detects: os.environ["KEY"], os.environ.get("KEY"), os.getenv("KEY"),
+             config("KEY"), settings.KEY patterns, dotenv keys, etc.
+    Returns deduplicated sorted list of key names.
+    """
+    import ast as _ast
+
+    SKIP_DIRS = {".venv", "node_modules", "__pycache__", ".git", "dist", "build"}
+    found: set = set()
+
+    # ── Pattern-based regex scan on all .py files ────────────────────────
+    # Covers os.environ["K"], os.environ.get("K"), os.getenv("K"),
+    # getenv("K"), environ["K"], config("K"), settings("K"), Secret("K")
+    env_patterns = [
+        re.compile(r'os\.environ\s*\[\s*["\']([A-Z][A-Z0-9_]{1,60})["\']\s*\]'),
+        re.compile(r'os\.environ\.get\s*\(\s*["\']([A-Z][A-Z0-9_]{1,60})["\']'),
+        re.compile(r'os\.getenv\s*\(\s*["\']([A-Z][A-Z0-9_]{1,60})["\']'),
+        re.compile(r'getenv\s*\(\s*["\']([A-Z][A-Z0-9_]{1,60})["\']'),
+        re.compile(r'environ\s*\[\s*["\']([A-Z][A-Z0-9_]{1,60})["\']\s*\]'),
+        re.compile(r'environ\.get\s*\(\s*["\']([A-Z][A-Z0-9_]{1,60})["\']'),
+        re.compile(r'config\s*\(\s*["\']([A-Z][A-Z0-9_]{1,60})["\']'),
+        re.compile(r'settings\s*\[\s*["\']([A-Z][A-Z0-9_]{1,60})["\']\s*\]'),
+        re.compile(r'Secret\s*\(\s*["\']([A-Z][A-Z0-9_]{1,60})["\']'),
+        re.compile(r'BaseSettings.*\n.*([A-Z][A-Z0-9_]{2,60})\s*:\s*str\s*='),
+    ]
+
+    # Keys that are definitely internal/platform — skip them
+    SKIP_KEYS = {
+        "PATH", "HOME", "USER", "SHELL", "LANG", "LC_ALL", "LC_CTYPE",
+        "PYTHONDONTWRITEBYTECODE", "PYTHONUNBUFFERED", "VIRTUAL_ENV",
+        "PORT", "HOST", "DEBUG", "ENVIRONMENT", "ENV", "NODE_ENV",
+        "PWD", "TERM", "COLORTERM", "TMPDIR", "TEMP", "TMP",
+    }
+
+    for root, dirs, files in os.walk(project_dir):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
+        for fname in files:
+            fpath = os.path.join(root, fname)
+
+            # .py files — regex scan
+            if fname.endswith(".py"):
+                try:
+                    text = open(fpath, errors="replace").read()
+                    for pat in env_patterns:
+                        for m in pat.finditer(text):
+                            key = m.group(1).strip()
+                            if key and key not in SKIP_KEYS and len(key) >= 3:
+                                found.add(key)
+                except Exception:
+                    pass
+
+            # .env / .env.example / .env.sample / .env.template
+            if fname in (".env", ".env.example", ".env.sample", ".env.template",
+                         ".env.local", "example.env", "sample.env"):
+                try:
+                    for line in open(fpath, errors="replace"):
+                        line = line.strip()
+                        if line and not line.startswith("#") and "=" in line:
+                            key = line.split("=", 1)[0].strip()
+                            if key and key not in SKIP_KEYS and re.match(r'^[A-Z][A-Z0-9_]{1,60}$', key):
+                                found.add(key)
+                except Exception:
+                    pass
+
+    return sorted(found)
+
+
+@app.get("/api/projects/{project_id}/scan-env")
+async def api_scan_env(request: Request, project_id: str):
+    """Scan the deployed project for all referenced env var keys."""
+    user = await get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401)
+
+    project = await db_get_project(project_id)
+    if not project or project.get("user_id") != user["id"]:
+        raise HTTPException(status_code=404)
+
+    project_dir = project.get("deploy_dir", "")
+    if not project_dir or not os.path.isdir(project_dir):
+        return JSONResponse({"keys": [], "existing": {}})
+
+    keys = scan_project_env_vars(project_dir)
+    existing = project.get("env_vars") or {}
+
+    return JSONResponse({
+        "keys": keys,
+        "existing": {k: v for k, v in existing.items()},  # redact nothing — user owns it
+    })
+
+
+@app.post("/api/projects/{project_id}/env-vars")
+async def api_update_env_vars(request: Request, project_id: str):
+    """Update env vars for a project and restart the latest deployment."""
+    user = await get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401)
+
+    project = await db_get_project(project_id)
+    if not project or project.get("user_id") != user["id"]:
+        raise HTTPException(status_code=404)
+
+    body = await request.json()
+    new_vars: Dict[str, str] = body.get("env_vars", {})
+
+    # Merge with existing (new values override)
+    existing = project.get("env_vars") or {}
+    merged = {**existing, **{k: v for k, v in new_vars.items() if k and v != "__KEEP__"}}
+    # Allow deleting: if value is empty string sent explicitly, keep it (user may want blank)
+
+    await db_update_project(project_id, {"env_vars": merged})
+
+    # Also update the running process env vars by restarting if running
+    should_restart = body.get("restart", True)
+    restarted = False
+    if should_restart:
+        # Find latest deployment
+        deps = await db_list_deployments(project_id)
+        if deps:
+            latest = deps[0]
+            dep_id = latest["id"]
+            if latest.get("status") in (DeployState.RUNNING, DeployState.RESTARTING):
+                # Restart in background
+                asyncio.create_task(_restart_with_new_env(project_id, dep_id, merged))
+                restarted = True
+
+    return JSONResponse({"success": True, "merged_count": len(merged), "restarted": restarted})
+
+
+async def _restart_with_new_env(project_id: str, deployment_id: str, env_vars: Dict[str, str]):
+    """Background task: restart deployment with updated env vars."""
+    try:
+        project    = await db_get_project(project_id)
+        deployment = await db_get_deployment(deployment_id)
+        if not project or not deployment:
+            return
+
+        project_dir = project.get("deploy_dir", "")
+        startup_cmd = project.get("startup_cmd") or deployment.get("startup_cmd", "")
+        if not project_dir or not startup_cmd:
+            return
+
+        await stop_deployment_process(deployment_id)
+        await asyncio.sleep(1)
+
+        port = allocate_port()
+        await db_update_deployment(deployment_id, {"port": port, "status": DeployState.RESTARTING})
+        await db_update_project(project_id, {"port": port})
+
+        pid = await start_app_process(
+            project_dir=project_dir,
+            startup_cmd=startup_cmd,
+            port=port,
+            deployment_id=deployment_id,
+            project_id=project_id,
+            env_vars=env_vars,
+        )
+        if pid:
+            await db_update_deployment(deployment_id, {"status": DeployState.RUNNING, "pid": pid})
+            await db_update_project(project_id, {"status": DeployState.RUNNING})
+            await db_add_log(deployment_id, project_id,
+                f"[{datetime.now().strftime('%H:%M:%S')}] ✅ Restarted with updated env vars (PID {pid})",
+                level="success", source="build")
+        else:
+            await db_update_deployment(deployment_id, {"status": DeployState.FAILED})
+            await db_update_project(project_id, {"status": DeployState.FAILED})
+    except Exception as exc:
+        logger.error(f"_restart_with_new_env error: {exc}")
 
 
 @app.delete("/api/projects/{project_id}")
