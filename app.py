@@ -148,6 +148,43 @@ def get_supabase_service() -> Client:
     return _supabase_service_client
 
 
+def _reset_supabase_clients():
+    """Force-recreate Supabase clients (called after SSL/connection errors)."""
+    global _supabase_client, _supabase_service_client
+    _supabase_client = None
+    _supabase_service_client = None
+
+
+async def _sb_execute(fn, retries: int = 3, label: str = "db"):
+    """
+    Run a synchronous Supabase call in a thread, with retry + SSL error recovery.
+    Wraps EVERY DB call so a transient SSL hiccup never crashes a route handler.
+    fn: zero-arg callable that performs the Supabase .execute() and returns result
+    """
+    import httpx as _httpx
+    last_exc = None
+    for attempt in range(1, retries + 1):
+        try:
+            # Run the blocking Supabase call in a thread pool (non-blocking)
+            result = await asyncio.get_event_loop().run_in_executor(None, fn)
+            return result
+        except (_httpx.ConnectError, _httpx.RemoteProtocolError,
+                _httpx.ReadError, _httpx.WriteError, _httpx.TimeoutException,
+                OSError) as exc:
+            last_exc = exc
+            # SSL EOF / connection error: reset client so next call re-connects
+            _reset_supabase_clients()
+            wait = 0.5 * (2 ** (attempt - 1))   # 0.5s, 1s, 2s
+            logger.warning(f"[{label}] network error (attempt {attempt}/{retries}): {exc} — retry in {wait}s")
+            await asyncio.sleep(wait)
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(f"[{label}] unexpected error (attempt {attempt}/{retries}): {exc}")
+            await asyncio.sleep(0.5)
+    # All retries exhausted — raise so callers can handle gracefully
+    raise RuntimeError(f"[{label}] failed after {retries} retries: {last_exc}") from last_exc
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # SECTION 4: DATABASE HELPERS
 # ──────────────────────────────────────────────────────────────────────────────
@@ -239,36 +276,32 @@ async def db_init_tables():
 
 
 async def db_create_user(email: str, password_hash: str, username: str) -> Dict:
-    sb = get_supabase_service()
-    result = sb.table("users").insert({
-        "email": email,
-        "password": password_hash,
-        "username": username,
-    }).execute()
+    payload = {"email": email, "password": password_hash, "username": username}
+    result = await _sb_execute(lambda: get_supabase_service().table("users").insert(payload).execute(), label="db_create_user")
     return result.data[0] if result.data else {}
 
 
 async def db_get_user_by_email(email: str) -> Optional[Dict]:
-    sb = get_supabase_service()
-    result = sb.table("users").select("*").eq("email", email).limit(1).execute()
-    return result.data[0] if result.data else None
+    try:
+        result = await _sb_execute(lambda: get_supabase_service().table("users").select("*").eq("email", email).limit(1).execute(), label="db_get_user_by_email")
+        return result.data[0] if result.data else None
+    except Exception as exc:
+        logger.warning(f"db_get_user_by_email failed: {exc}"); return None
 
 
 async def db_get_user_by_id(user_id: str) -> Optional[Dict]:
-    sb = get_supabase_service()
-    result = sb.table("users").select("*").eq("id", user_id).limit(1).execute()
-    return result.data[0] if result.data else None
+    try:
+        result = await _sb_execute(lambda: get_supabase_service().table("users").select("*").eq("id", user_id).limit(1).execute(), label="db_get_user_by_id")
+        return result.data[0] if result.data else None
+    except Exception as exc:
+        logger.warning(f"db_get_user_by_id failed: {exc}"); return None
 
 
 async def db_create_session(user_id: str) -> str:
-    sb = get_supabase_service()
     token = uuid.uuid4().hex + uuid.uuid4().hex
     expires = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
-    sb.table("sessions").insert({
-        "user_id": user_id,
-        "token": token,
-        "expires_at": expires,
-    }).execute()
+    payload = {"user_id": user_id, "token": token, "expires_at": expires}
+    await _sb_execute(lambda: get_supabase_service().table("sessions").insert(payload).execute(), label="db_create_session")
     return token
 
 
@@ -298,17 +331,17 @@ async def db_get_session(token: str) -> Optional[Dict]:
         if time.monotonic() - cached_at <= SESSION_CACHE_TTL:
             return session_data  # no Supabase call
 
-    # 2. Cache miss — hit Supabase
-    sb = get_supabase_service()
-    result = (
-        sb.table("sessions")
-        .select("*, users(*)")
-        .eq("token", token)
-        .gt("expires_at", datetime.now(timezone.utc).isoformat())
-        .limit(1)
-        .execute()
-    )
-    session_data = result.data[0] if result.data else None
+    # 2. Cache miss — hit Supabase (resilient)
+    expires = datetime.now(timezone.utc).isoformat()
+    def _fetch():
+        sb = get_supabase_service()
+        return sb.table("sessions").select("*, users(*)").eq("token", token).gt("expires_at", expires).limit(1).execute()
+    try:
+        result = await _sb_execute(_fetch, label="db_get_session")
+        session_data = result.data[0] if result.data else None
+    except Exception as exc:
+        logger.warning(f"db_get_session failed: {exc}")
+        return None
 
     # 3. Populate cache (even None, so we dont hammer Supabase for invalid tokens)
     _session_cache[token] = (session_data, time.monotonic())
@@ -316,89 +349,81 @@ async def db_get_session(token: str) -> Optional[Dict]:
 
 
 async def db_delete_session(token: str):
-    # Evict from cache immediately so logout takes effect right away
     _session_cache.pop(token, None)
-    sb = get_supabase_service()
-    sb.table("sessions").delete().eq("token", token).execute()
+    try:
+        await _sb_execute(lambda: get_supabase_service().table("sessions").delete().eq("token", token).execute(), label="db_delete_session")
+    except Exception: pass
 
 
 async def db_create_project(user_id: str, name: str, description: str = "") -> Dict:
-    sb = get_supabase_service()
-    result = sb.table("projects").insert({
-        "user_id": user_id,
-        "name": name,
-        "description": description,
-        "status": DeployState.PENDING,
-    }).execute()
+    payload = {"user_id": user_id, "name": name, "description": description, "status": DeployState.PENDING}
+    result = await _sb_execute(lambda: get_supabase_service().table("projects").insert(payload).execute(), label="db_create_project")
     return result.data[0] if result.data else {}
 
 
 async def db_update_project(project_id: str, updates: Dict) -> Dict:
-    sb = get_supabase_service()
     updates["updated_at"] = datetime.now(timezone.utc).isoformat()
-    result = sb.table("projects").update(updates).eq("id", project_id).execute()
-    return result.data[0] if result.data else {}
+    upd = dict(updates)
+    try:
+        result = await _sb_execute(lambda: get_supabase_service().table("projects").update(upd).eq("id", project_id).execute(), label="db_update_project")
+        return result.data[0] if result.data else {}
+    except Exception as exc:
+        logger.warning(f"db_update_project failed: {exc}"); return {}
 
 
 async def db_get_project(project_id: str) -> Optional[Dict]:
-    sb = get_supabase_service()
-    result = sb.table("projects").select("*").eq("id", project_id).limit(1).execute()
-    return result.data[0] if result.data else None
+    try:
+        result = await _sb_execute(lambda: get_supabase_service().table("projects").select("*").eq("id", project_id).limit(1).execute(), label="db_get_project")
+        return result.data[0] if result.data else None
+    except Exception as exc:
+        logger.warning(f"db_get_project failed: {exc}"); return None
 
 
 async def db_list_projects(user_id: str) -> List[Dict]:
-    sb = get_supabase_service()
-    result = (
-        sb.table("projects")
-        .select("*")
-        .eq("user_id", user_id)
-        .order("created_at", desc=True)
-        .execute()
-    )
-    return result.data or []
+    try:
+        result = await _sb_execute(lambda: get_supabase_service().table("projects").select("*").eq("user_id", user_id).order("created_at", desc=True).execute(), label="db_list_projects")
+        return result.data or []
+    except Exception as exc:
+        logger.warning(f"db_list_projects failed: {exc}"); return []
 
 
 async def db_delete_project(project_id: str):
-    sb = get_supabase_service()
-    sb.table("projects").delete().eq("id", project_id).execute()
+    try:
+        await _sb_execute(lambda: get_supabase_service().table("projects").delete().eq("id", project_id).execute(), label="db_delete_project")
+    except Exception: pass
 
 
 async def db_create_deployment(project_id: str, user_id: str, framework: str, startup_cmd: str) -> Dict:
-    sb = get_supabase_service()
-    result = sb.table("deployments").insert({
-        "project_id": project_id,
-        "user_id": user_id,
-        "framework": framework,
-        "startup_cmd": startup_cmd,
-        "status": DeployState.PENDING,
-        "started_at": datetime.now(timezone.utc).isoformat(),
-    }).execute()
+    payload = {"project_id": project_id, "user_id": user_id, "framework": framework,
+               "startup_cmd": startup_cmd, "status": DeployState.PENDING,
+               "started_at": datetime.now(timezone.utc).isoformat()}
+    result = await _sb_execute(lambda: get_supabase_service().table("deployments").insert(payload).execute(), label="db_create_deployment")
     return result.data[0] if result.data else {}
 
 
 async def db_update_deployment(deployment_id: str, updates: Dict) -> Dict:
-    sb = get_supabase_service()
-    result = sb.table("deployments").update(updates).eq("id", deployment_id).execute()
-    return result.data[0] if result.data else {}
+    upd = dict(updates)
+    try:
+        result = await _sb_execute(lambda: get_supabase_service().table("deployments").update(upd).eq("id", deployment_id).execute(), label="db_update_deployment")
+        return result.data[0] if result.data else {}
+    except Exception as exc:
+        logger.warning(f"db_update_deployment failed: {exc}"); return {}
 
 
 async def db_get_deployment(deployment_id: str) -> Optional[Dict]:
-    sb = get_supabase_service()
-    result = sb.table("deployments").select("*").eq("id", deployment_id).limit(1).execute()
-    return result.data[0] if result.data else None
+    try:
+        result = await _sb_execute(lambda: get_supabase_service().table("deployments").select("*").eq("id", deployment_id).limit(1).execute(), label="db_get_deployment")
+        return result.data[0] if result.data else None
+    except Exception as exc:
+        logger.warning(f"db_get_deployment failed: {exc}"); return None
 
 
 async def db_list_deployments(project_id: str) -> List[Dict]:
-    sb = get_supabase_service()
-    result = (
-        sb.table("deployments")
-        .select("*")
-        .eq("project_id", project_id)
-        .order("created_at", desc=True)
-        .limit(20)
-        .execute()
-    )
-    return result.data or []
+    try:
+        result = await _sb_execute(lambda: get_supabase_service().table("deployments").select("*").eq("project_id", project_id).order("created_at", desc=True).limit(20).execute(), label="db_list_deployments")
+        return result.data or []
+    except Exception as exc:
+        logger.warning(f"db_list_deployments failed: {exc}"); return []
 
 
 # ── Log batching ────────────────────────────────────────────────────────────
@@ -418,8 +443,8 @@ async def _flush_log_buffer(deployment_id: str):
     if not rows:
         return
     try:
-        sb = get_supabase_service()
-        sb.table("logs").insert(rows).execute()
+        rows_copy = list(rows)
+        await _sb_execute(lambda: get_supabase_service().table("logs").insert(rows_copy).execute(), label="log_batch_flush")
     except Exception as e:
         logger.warning(f"Batch log flush failed ({len(rows)} rows): {e}")
 
@@ -445,8 +470,8 @@ async def db_add_log(deployment_id: str, project_id: str, message: str,
         if old_task and not old_task.done():
             old_task.cancel()
         try:
-            sb = get_supabase_service()
-            sb.table("logs").insert(rows).execute()
+            rows_copy = list(rows)
+            await _sb_execute(lambda: get_supabase_service().table("logs").insert(rows_copy).execute(), label="log_immediate_flush")
         except Exception as e:
             logger.warning(f"Immediate log flush failed: {e}")
         return
@@ -469,36 +494,28 @@ async def db_flush_logs(deployment_id: str):
     if not rows:
         return
     try:
-        sb = get_supabase_service()
-        sb.table("logs").insert(rows).execute()
+        rows_copy = list(rows)
+        await _sb_execute(lambda: get_supabase_service().table("logs").insert(rows_copy).execute(), label="log_final_flush")
     except Exception as e:
         logger.warning(f"Final log flush failed: {e}")
 
 
 async def db_get_logs(deployment_id: str, limit: int = 200) -> List[Dict]:
-    sb = get_supabase_service()
-    result = (
-        sb.table("logs")
-        .select("*")
-        .eq("deployment_id", deployment_id)
-        .order("created_at", desc=False)
-        .limit(limit)
-        .execute()
-    )
-    return result.data or []
+    try:
+        lim = limit
+        result = await _sb_execute(lambda: get_supabase_service().table("logs").select("*").eq("deployment_id", deployment_id).order("created_at", desc=False).limit(lim).execute(), label="db_get_logs")
+        return result.data or []
+    except Exception as exc:
+        logger.warning(f"db_get_logs failed: {exc}"); return []
 
 
 async def db_get_project_logs(project_id: str, limit: int = 200) -> List[Dict]:
-    sb = get_supabase_service()
-    result = (
-        sb.table("logs")
-        .select("*")
-        .eq("project_id", project_id)
-        .order("created_at", desc=False)
-        .limit(limit)
-        .execute()
-    )
-    return result.data or []
+    try:
+        lim = limit
+        result = await _sb_execute(lambda: get_supabase_service().table("logs").select("*").eq("project_id", project_id).order("created_at", desc=False).limit(lim).execute(), label="db_get_project_logs")
+        return result.data or []
+    except Exception as exc:
+        logger.warning(f"db_get_project_logs failed: {exc}"); return []
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1009,15 +1026,30 @@ class BuildSystem:
         elif (Path(frontend_dir) / "pnpm-lock.yaml").exists():
             pkg_manager = "pnpm"
 
-        # npm install
-        result = await cls.run_command(
-            f"{pkg_manager} install --legacy-peer-deps",
-            cwd=frontend_dir,
-            timeout=300,
-        )
+        # Verify package.json exists before trying npm install
+        pkg_json = os.path.join(frontend_dir, "package.json")
+        if not os.path.exists(pkg_json):
+            await db_add_log(deployment_id, project_id,
+                f"⚠️  No package.json found in {frontend_dir} — skipping npm install",
+                level="warning", source="build")
+            return False
+
+        # npm install — CI=true avoids interactive prompts, --no-audit speeds it up
+        install_cmd = f"CI=true {pkg_manager} install --legacy-peer-deps --no-audit --prefer-offline"
+        await db_add_log(deployment_id, project_id, f"Running: {install_cmd}", source="build")
+        result = await cls.run_command(install_cmd, cwd=frontend_dir, timeout=600)
 
         if result["returncode"] != 0:
-            msg = f"npm install failed: {result['stderr'][:500]}"
+            # Retry without --prefer-offline (cache might be empty)
+            await db_add_log(deployment_id, project_id, "npm install with cache failed, retrying fresh...", level="warning", source="build")
+            result = await cls.run_command(
+                f"CI=true {pkg_manager} install --legacy-peer-deps --no-audit",
+                cwd=frontend_dir, timeout=900,
+            )
+        if result["returncode"] != 0:
+            stdout_tail = (result.get("stdout","") + result.get("stderr",""))[-800:]
+            rc = result["returncode"]
+            msg = f"npm install failed (exit {rc}):\n{stdout_tail}"
             await db_add_log(deployment_id, project_id, msg, level="error", source="build")
             return False
 
@@ -1026,13 +1058,15 @@ class BuildSystem:
 
         build_cmd = "npm run build" if pkg_manager == "npm" else f"{pkg_manager} build"
         result = await cls.run_command(
-            build_cmd,
+            f"CI=true {build_cmd}",
             cwd=frontend_dir,
-            timeout=600,
+            timeout=900,
         )
 
         if result["returncode"] != 0:
-            msg = f"Frontend build failed: {result['stderr'][:500]}"
+            stdout_tail = (result.get("stdout","") + result.get("stderr",""))[-800:]
+            rc = result["returncode"]
+            msg = f"Frontend build failed (exit {rc}):\n{stdout_tail}"
             await db_add_log(deployment_id, project_id, msg, level="error", source="build")
             return False
 
