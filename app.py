@@ -3205,8 +3205,8 @@ def render_upload_page(user: Dict, error: str = "", success: str = "") -> str:
       <p style="margin:0; color:var(--muted); font-size:14px;">Upload any ZIP — Python, static HTML, bots, workers, full-stack. We handle the rest.</p>
     </div>
 
-    {{'<div style="background:#00ff8811;border:1px solid #00ff8833;border-radius:8px;padding:14px;margin-bottom:24px;color:#00ff88;font-size:13px;">✓ ' + success + '</div>' if success else ''}}
-    {{'<div style="background:#ff3b3b22;border:1px solid #ff3b3b44;border-radius:8px;padding:14px;margin-bottom:24px;color:#ff6b6b;font-size:13px;">⚠ ' + error + '</div>' if error else ''}}
+    {'<div style="background:#00ff8811;border:1px solid #00ff8833;border-radius:8px;padding:14px;margin-bottom:24px;color:#00ff88;font-size:13px;">✓ ' + success + '</div>' if success else ''}
+    {'<div style="background:#ff3b3b22;border:1px solid #ff3b3b44;border-radius:8px;padding:14px;margin-bottom:24px;color:#ff6b6b;font-size:13px;">⚠ ' + error + '</div>' if error else ''}
 
     <form id="uploadForm" enctype="multipart/form-data">
 
@@ -3238,7 +3238,7 @@ def render_upload_page(user: Dict, error: str = "", success: str = "") -> str:
       <div id="pythonHints" class="card" style="padding:20px;margin-bottom:20px;border-color:#7c3aed44;background:#7c3aed08;">
         <div style="font-size:12px;color:#a78bfa;font-weight:700;letter-spacing:.5px;text-transform:uppercase;margin-bottom:10px;">📋 Supported Python Projects</div>
         <div style="display:flex;flex-wrap:wrap;gap:6px;">
-          {{''.join(f'<span class="framework-chip">{fw}</span>' for fw in ["FastAPI","Flask","Django","Tornado","aiohttp","Streamlit","Gradio","Telegram Bot","Discord Bot","gRPC","Celery","Workers","Scripts"])}}
+          {''.join(f'<span class="framework-chip">{fw}</span>' for fw in ["FastAPI","Flask","Django","Tornado","aiohttp","Streamlit","Gradio","Telegram Bot","Discord Bot","gRPC","Celery","Workers","Scripts"])}
         </div>
       </div>
 
@@ -3246,7 +3246,7 @@ def render_upload_page(user: Dict, error: str = "", success: str = "") -> str:
       <div id="frontendHints" style="display:none;" class="card" style="padding:20px;margin-bottom:20px;border-color:#06b6d444;background:#06b6d408;">
         <div style="font-size:12px;color:#22d3ee;font-weight:700;letter-spacing:.5px;text-transform:uppercase;margin-bottom:10px;">🌐 Supported Frontend Projects</div>
         <div style="display:flex;flex-wrap:wrap;gap:6px;">
-          {{''.join(f'<span class="framework-chip">{fw}</span>' for fw in ["HTML / CSS / JS","React","Vue","Svelte","Next.js","Vite","Static Site","Landing Page","Dashboard"])}}
+          {''.join(f'<span class="framework-chip">{fw}</span>' for fw in ["HTML / CSS / JS","React","Vue","Svelte","Next.js","Vite","Static Site","Landing Page","Dashboard"])}
         </div>
         <div style="margin-top:10px;font-size:12px;color:var(--muted);">No backend needed — your files are served directly. Just include an <code style="color:#22d3ee;">index.html</code> in your ZIP root.</div>
       </div>
