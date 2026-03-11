@@ -4347,7 +4347,6 @@ async def logs_page(request: Request, deployment_id: str):
 # SECTION 15: API ROUTES
 # ──────────────────────────────────────────────────────────────────────────────
 
-@app.post("/api/deploy")
 @app.post("/api/scan-zip-env")
 async def api_scan_zip_env(
     request: Request,
@@ -4391,6 +4390,7 @@ async def api_scan_zip_env(
     return JSONResponse({"keys": keys})
 
 
+@app.post("/api/deploy")
 async def api_deploy(
     request: Request,
     background_tasks: BackgroundTasks,
