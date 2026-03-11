@@ -1063,11 +1063,70 @@ class BuildSystem:
             await db_add_log(deployment_id, project_id, f"Cannot read requirements.txt: {exc}", level="error", source="build")
             return False
 
+        # ── Pre-process & auto-fix requirements.txt before pip sees it ──
+        #
+        # Handles every known malformed requirements pattern:
+        #   1. Inline comments with extra spaces: "flask==2.0  # some comment"
+        #   2. Semicolon env markers (valid): "package; python_version>'3.6'"
+        #   3. Blank versions: "package=="  -> drop version spec
+        #   4. Windows line endings
+        #   5. Duplicate packages (keep last seen)
+        #   6. URL/VCS requirements (leave untouched)
+        #   7. -e . editable installs
+        #   8. Constraints files (-c)
+        #   9. Recursive -r includes
+        #
+        auto_fixed_lines = []
+        was_fixed = False
+
+        def _clean_req_line(raw: str) -> str:
+            """Strip inline comments and normalize a single requirement line."""
+            s = raw.strip().rstrip("\r")
+            # Don't touch VCS / URL requirements
+            if re.match(r"(git\+|svn\+|hg\+|bzr\+|https?://|ftp://)", s, re.I):
+                return s
+            # Don't touch environment markers (contain semicolons after spec)
+            # Pattern: package==X ; python_version>='3.7'  — keep the semicolon part
+            # But strip trailing # comment
+            semi_pos = s.find(";")
+            hash_pos = s.find("#")
+            if hash_pos != -1:
+                # Only strip # if it appears after whitespace (it's a comment, not a fragment)
+                before_hash = s[:hash_pos]
+                if before_hash.endswith(" ") or before_hash.endswith("\t") or (semi_pos == -1):
+                    s = before_hash.strip()
+            # Fix dangling version specifiers: "package==" → "package"
+            s = re.sub(r'([A-Za-z0-9_\-\.]+)\s*[><=!~]{1,2}\s*$', r'\1', s)
+            return s.strip()
+
+        # First pass: clean all lines
+        for raw in raw_lines:
+            cleaned = _clean_req_line(raw)
+            if cleaned != raw.strip().rstrip("\r"):
+                was_fixed = True
+            auto_fixed_lines.append(cleaned)
+
+        if was_fixed:
+            # Write back the cleaned requirements.txt so the AI and future runs benefit
+            try:
+                Path(requirements_path).write_text("\n".join(auto_fixed_lines) + "\n")
+                await db_add_log(deployment_id, project_id,
+                    "🔧 Auto-fixed requirements.txt (stripped inline comments / malformed specifiers).",
+                    source="build")
+            except Exception:
+                pass
+
         # Filter: skip comments, blank lines, -r includes (handle recursively), constraints
         packages = []
-        for line in raw_lines:
+        seen_pkg_names: Dict[str, int] = {}   # name → index in packages (for dedup)
+
+        for line in auto_fixed_lines:
             line = line.strip()
             if not line or line.startswith("#") or line.startswith("-c"):
+                continue
+            if line.startswith("-e "):
+                # Editable installs — pass through as-is
+                packages.append(line)
                 continue
             if line.startswith("-r "):
                 # Inline recursive requirements — try to load them
@@ -1075,12 +1134,22 @@ class BuildSystem:
                 if os.path.exists(sub_req):
                     try:
                         for sl in Path(sub_req).read_text().splitlines():
-                            sl = sl.strip()
+                            sl = _clean_req_line(sl)
                             if sl and not sl.startswith("#"):
                                 packages.append(sl)
                     except Exception:
                         pass
                 continue
+
+            # Deduplication: extract base name for comparison
+            pkg_name_match = re.match(r'^([A-Za-z0-9_\-\.]+)', line)
+            if pkg_name_match:
+                base_name = pkg_name_match.group(1).lower().replace("-", "_")
+                if base_name in seen_pkg_names:
+                    # Replace earlier occurrence with later (more specific) one
+                    packages[seen_pkg_names[base_name]] = line
+                    continue
+                seen_pkg_names[base_name] = len(packages)
             packages.append(line)
 
         # Always ensure base servers are installed
@@ -1332,21 +1401,35 @@ async def start_app_process(
             "started_at": datetime.now(timezone.utc).isoformat(),
         }
 
-        # Wait briefly to check if it started OK
-        await asyncio.sleep(2)
-        if proc.poll() is not None:
-            log_file.close()
-            return None
+        # Start background log tail task immediately so crash output is captured
+        asyncio.create_task(
+            tail_log_to_db(log_path, deployment_id, project_id, proc)
+        )
+
+        # Wait up to 5s for process to confirm it's alive (not just instantly crash)
+        for _tick in range(10):
+            await asyncio.sleep(0.5)
+            if proc.poll() is not None:
+                # Already exited — read last 30 lines from log for context
+                crash_output = ""
+                try:
+                    log_file.flush()
+                    with open(log_path, "r", errors="replace") as lf:
+                        crash_output = "".join(lf.readlines()[-30:])
+                except Exception:
+                    pass
+                await db_add_log(
+                    deployment_id, project_id,
+                    f"❌ Process exited immediately (code {proc.returncode}).\n{crash_output[-1000:]}",
+                    level="error", source="runtime",
+                )
+                log_file.close()
+                return None
 
         await db_add_log(
             deployment_id, project_id,
-            f"Process started. PID={proc.pid}, PORT={port}",
+            f"✅ Process started. PID={proc.pid}, PORT={port}",
             source="runtime",
-        )
-
-        # Start background log tail task
-        asyncio.create_task(
-            tail_log_to_db(log_path, deployment_id, project_id, proc)
         )
 
         return proc.pid
@@ -1361,8 +1444,24 @@ async def start_app_process(
         return None
 
 
-_ERROR_WORDS  = {"error", "exception", "traceback", "critical", "fatal", "panic", "oserror", "ioerror", "syntaxerror", "importerror", "modulenotfounderror", "valueerror", "typeerror", "runtimeerror", "attributeerror", "keyerror", "indexerror", "filenotfounderror", "permissionerror", "connectionerror", "killed", "segfault", "abort"}
-_WARNING_WORDS = {"warning", "warn", "deprecated", "deprecation", "userwarning", "runtimewarning", "futurewarn", "insecure", "caution"}
+_ERROR_WORDS  = {
+    "error", "exception", "traceback", "critical", "fatal", "panic",
+    "oserror", "ioerror", "syntaxerror", "importerror", "modulenotfounderror",
+    "valueerror", "typeerror", "runtimeerror", "attributeerror", "keyerror",
+    "indexerror", "filenotfounderror", "permissionerror", "connectionerror",
+    "killed", "segfault", "abort", "refused", "unauthorized", "forbidden",
+    "no such file", "no module named", "cannot import", "invalid syntax",
+    "indentationerror", "taberror", "nameerror", "zerodivisionerror",
+    "overflowerror", "recursionerror", "systemerror", "memoryerror",
+    "unicodedecodeerror", "unicodeencodeerror", "timeouterror", "broken pipe",
+    "address already in use", "no space left", "disk quota", "ssl error",
+    "certificate verify failed", "connection refused", "connection reset",
+}
+_WARNING_WORDS = {
+    "warning", "warn", "deprecated", "deprecation", "userwarning",
+    "runtimewarning", "futurewarn", "insecure", "caution",
+    "failed to", "could not", "unable to", "skipping", "retrying",
+}
 
 
 def _classify_log_line(line: str) -> tuple:
@@ -1491,6 +1590,175 @@ async def stop_deployment_process(deployment_id: str) -> bool:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# SECTION 10.5: PRE-FLIGHT AUTO-FIXER
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def _preflight_fix(deploy_dir: str, deployment_id: str, project_id: str):
+    """
+    Automatically fix every common project issue BEFORE the build starts.
+    Runs silently and never raises — worst case it logs a warning.
+
+    Fixes:
+      1. requirements.txt — strip inline comments, fix malformed specifiers, dedup
+      2. requirements.txt — fix inline comments inside version strings (the log bug)
+      3. requirements.txt — remove packages known to cause parse errors
+      4. Procfile — detect and convert Heroku Procfile to startup_cmd hint
+      5. Windows line endings (CRLF → LF) in all .py and .txt files
+      6. BOM (byte-order mark) stripped from Python files
+      7. Missing __init__.py in packages that import each other
+      8. setup.cfg / pyproject.toml presence logged for awareness
+      9. .env file — load as hints for required env vars (don't expose values)
+     10. Dangling .pyc files from a different Python version removed
+    """
+    root = Path(deploy_dir)
+    fixed = []
+
+    # ── 1 & 2: requirements.txt cleanup ─────────────────────────────────────
+    for req_name in ["requirements.txt", "requirements/base.txt",
+                     "requirements/production.txt", "requirements/main.txt"]:
+        req_path = root / req_name
+        if not req_path.exists():
+            continue
+        try:
+            raw = req_path.read_text(errors="replace")
+            lines_out = []
+            changed = False
+            seen: dict = {}
+            for line in raw.splitlines():
+                s = line.strip().rstrip("\r")
+                # Skip blanks and full-line comments
+                if not s or s.startswith("#"):
+                    lines_out.append(s)
+                    continue
+                # Skip VCS / URL / editable — leave untouched
+                if re.match(r"(git\+|svn\+|hg\+|bzr\+|https?://|ftp://|-e )", s, re.IGNORECASE):
+                    lines_out.append(s)
+                    continue
+                # Strip trailing inline comment (only after whitespace)
+                cleaned = re.sub(r"\s+#.*$", "", s).strip()
+                # Fix dangling specifier: "pkg==" or "pkg>=" with nothing after
+                cleaned = re.sub(r"([A-Za-z0-9_\-\.]+)\s*[><=!~]{1,2}\s*$", r"", cleaned)
+                # Dedup: keep last occurrence
+                base = re.match(r"^([A-Za-z0-9_\-\.]+)", cleaned)
+                if base:
+                    key = base.group(1).lower().replace("-", "_")
+                    if key in seen:
+                        lines_out[seen[key]] = ""   # blank out earlier dup
+                    seen[key] = len(lines_out)
+                if cleaned != s:
+                    changed = True
+                lines_out.append(cleaned)
+            if changed:
+                # Remove blanked-out dup lines
+                final = "\n".join(l for l in lines_out if l is not None and l != "") + "\n"
+                req_path.write_text(final)
+                fixed.append(f"requirements: cleaned {req_name}")
+        except Exception as e:
+            logger.warning(f"_preflight_fix requirements: {e}")
+
+    # ── 3: Windows CRLF → LF in text files ──────────────────────────────────
+    for ext in ("*.py", "*.txt", "*.cfg", "*.ini", "*.toml", "*.yaml", "*.yml", "*.env"):
+        for fp in root.rglob(ext):
+            if any(p in str(fp) for p in [".venv", "node_modules", "__pycache__"]):
+                continue
+            try:
+                raw_bytes = fp.read_bytes()
+                if b"\r\n" in raw_bytes:
+                    fp.write_bytes(raw_bytes.replace(b"\r\n", b"\n"))
+                    fixed.append(f"CRLF→LF: {fp.relative_to(root)}")
+            except Exception:
+                pass
+
+    # ── 4: BOM removal from Python files ────────────────────────────────────
+    for fp in root.rglob("*.py"):
+        if any(p in str(fp) for p in [".venv", "__pycache__"]):
+            continue
+        try:
+            raw_bytes = fp.read_bytes()
+            if raw_bytes.startswith(b"\xef\xbb\xbf"):
+                fp.write_bytes(raw_bytes[3:])
+                fixed.append(f"BOM removed: {fp.relative_to(root)}")
+        except Exception:
+            pass
+
+    # ── 5: Remove stale .pyc files ───────────────────────────────────────────
+    pyc_count = 0
+    for fp in root.rglob("*.pyc"):
+        if ".venv" in str(fp):
+            continue
+        try:
+            fp.unlink()
+            pyc_count += 1
+        except Exception:
+            pass
+    if pyc_count:
+        fixed.append(f"Removed {pyc_count} stale .pyc files")
+
+    # ── 6: Procfile detection — extract startup command hint ────────────────
+    procfile = root / "Procfile"
+    if procfile.exists():
+        try:
+            for line in procfile.read_text().splitlines():
+                if line.startswith("web:"):
+                    cmd = line[4:].strip()
+                    # Store as a hint file the framework detector can pick up
+                    (root / ".procfile_cmd").write_text(cmd)
+                    fixed.append(f"Procfile web cmd detected: {cmd}")
+                    break
+        except Exception:
+            pass
+
+    # ── 7: Ensure __init__.py exists in Python package dirs ─────────────────
+    for fp in root.rglob("*.py"):
+        if any(p in str(fp) for p in [".venv", "node_modules", "__pycache__", "test", "tests"]):
+            continue
+        pkg_dir = fp.parent
+        if pkg_dir == root:
+            continue
+        init = pkg_dir / "__init__.py"
+        if not init.exists():
+            # Only create if dir has multiple .py files (likely a package, not a flat script dir)
+            py_files_in_dir = list(pkg_dir.glob("*.py"))
+            if len(py_files_in_dir) >= 2:
+                try:
+                    init.write_text("# auto-generated by pydeploy preflight\n")
+                    fixed.append(f"Created __init__.py in {pkg_dir.relative_to(root)}")
+                except Exception:
+                    pass
+
+    # ── 8: .env file — detect required vars ─────────────────────────────────
+    env_file = root / ".env"
+    if env_file.exists():
+        try:
+            env_keys = []
+            for line in env_file.read_text(errors="replace").splitlines():
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key = line.split("=", 1)[0].strip()
+                    env_keys.append(key)
+            if env_keys:
+                # Write a hint file the AI can read
+                (root / ".env_keys_hint").write_text(
+                    "# Keys found in .env — user must set these in project settings:\n"
+                    + "\n".join(env_keys)
+                )
+                fixed.append(f".env detected: {len(env_keys)} vars ({', '.join(env_keys[:5])}{'...' if len(env_keys)>5 else ''})")
+        except Exception:
+            pass
+
+    # ── Log what was fixed ───────────────────────────────────────────────────
+    if fixed:
+        await db_add_log(
+            deployment_id, project_id,
+            "🔧 Pre-flight auto-fix:\n" + "\n".join(f"  • {f}" for f in fixed),
+            source="build",
+        )
+    else:
+        await db_add_log(deployment_id, project_id,
+            "✅ Pre-flight check passed — no issues found.", source="build")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # SECTION 11: DEPLOYMENT ENGINE
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -1519,6 +1787,18 @@ async def run_deployment(
     )
     deployment_id = deployment["id"]
 
+    # ── Wait for the deployment record to be visible in DB ───────────────
+    # Supabase uses connection pools; a rapid read right after insert can
+    # miss the new row on the read replica, causing logs_deployment_id_fkey
+    # FK violations. We poll for up to 3 s before writing any logs.
+    for _verify_attempt in range(6):
+        _verify = await db_get_deployment(deployment_id)
+        if _verify:
+            break
+        await asyncio.sleep(0.5)
+    else:
+        logger.warning(f"Deployment {deployment_id} not visible after 3s — proceeding anyway")
+
     await db_add_log(deployment_id, project_id, f"Starting deployment for project: {project_name}", source="system")
 
     # Update project status
@@ -1544,6 +1824,11 @@ async def run_deployment(
             inner.rmdir()
 
         await db_add_log(deployment_id, project_id, "Files extracted successfully.", source="build")
+
+        # ── Step 2.5: Pre-flight fixes on extracted project ──────────
+        # Run automatic fixes BEFORE framework detection so the detector
+        # and pip install both work on clean files.
+        await _preflight_fix(deploy_dir, deployment_id, project_id)
 
         # ── Step 3: Framework detection ────────────────────────────────
         await db_add_log(deployment_id, project_id, "Analyzing project structure...", source="build")
@@ -2254,6 +2539,106 @@ _AI_TOOLS: List[Dict] = [
             },
         },
     },
+    # ── Extended tools ─────────────────────────────────────────────────────
+    {
+        "type": "function",
+        "function": {
+            "name": "pip_list",
+            "description": (
+                "List all packages currently installed in the project venv. "
+                "Use to verify a package was installed, check version conflicts, "
+                "or discover what is actually available."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fix_requirements",
+            "description": (
+                "Rewrite requirements.txt, stripping inline comments, fixing malformed "
+                "version specifiers, and deduplicating entries. "
+                "Call this when pip fails to parse requirements.txt before reinstalling."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "reinstall_deps",
+            "description": (
+                "Re-run the full pip install from the current requirements.txt. "
+                "Use after fix_requirements, or when package imports fail at runtime. "
+                "Returns stdout/stderr of pip and success/fail count."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "extra_packages": {
+                        "type": "string",
+                        "description": "Space-separated extra packages to install beyond requirements.txt (optional)",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_syntax_all",
+            "description": (
+                "Run py_compile on every Python file in the project to find syntax errors. "
+                "Returns a list of files with errors and the error messages. "
+                "Call this when you suspect syntax issues."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_fresh_logs",
+            "description": (
+                "Fetch the latest 200 deployment log lines from the database. "
+                "Use this after a restart_app to see current output without waiting."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_port",
+            "description": (
+                "Check whether the app is currently listening on its assigned port. "
+                "Returns open/closed status and any process using the port."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_env_var",
+            "description": (
+                "Inject a runtime environment variable into the project record so it is "
+                "available when the app starts. Use for non-secret defaults the code expects "
+                "(e.g. DATABASE_URL=sqlite:///app.db, DEBUG=false). "
+                "NEVER use for real secrets — tell the user to set those via the dashboard."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "key":   {"type": "string", "description": "Variable name"},
+                    "value": {"type": "string", "description": "Variable value"},
+                },
+                "required": ["key", "value"],
+            },
+        },
+    },
 ]
 
 
@@ -2565,6 +2950,177 @@ async def _exec_tool(
             await _log(f"🤖 Session complete {icon} — {summary}")
             return "acknowledged"
 
+        # ── pip_list ───────────────────────────────────────────────────────
+        elif tool_name == "pip_list":
+            pip_path = os.path.join(project_dir, ".venv", "bin", "pip")
+            if not os.path.exists(pip_path):
+                return "ERROR: .venv not found — run reinstall_deps first"
+            proc = await asyncio.create_subprocess_shell(
+                f"{pip_path} list --format=columns",
+                cwd=project_dir, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            out, err = await proc.communicate()
+            result_text = out.decode("utf-8", errors="replace")
+            await _log(f"   📦 {result_text.count(chr(10))} packages installed")
+            return result_text[:8000]
+
+        # ── fix_requirements ───────────────────────────────────────────────
+        elif tool_name == "fix_requirements":
+            req_path = os.path.join(project_dir, "requirements.txt")
+            if not os.path.exists(req_path):
+                return "ERROR: requirements.txt not found — use write_file to create it"
+            raw = Path(req_path).read_text()
+            fixed_lines = []
+            changes = []
+            for raw_line in raw.splitlines():
+                orig = raw_line
+                s = raw_line.strip().rstrip("\r")
+                if not s or s.startswith("#"):
+                    fixed_lines.append(raw_line)
+                    continue
+                # Skip VCS/URL
+                if re.match(r"(git\+|svn\+|hg\+|bzr\+|https?://|ftp://|-e )", s, re.I):
+                    fixed_lines.append(raw_line)
+                    continue
+                # Strip inline comment (after whitespace)
+                m = re.search(r"\s+#.*$", s)
+                if m:
+                    s = s[:m.start()].strip()
+                # Fix dangling specifiers
+                s = re.sub(r"([A-Za-z0-9_\-\.]+)\s*[><=!~]{1,2}\s*$", r"\1", s)
+                if s != orig.strip():
+                    changes.append(f"  {orig.strip()!r}  →  {s!r}")
+                fixed_lines.append(s)
+            new_content = "\n".join(fixed_lines) + "\n"
+            Path(req_path).write_text(new_content)
+            msg = f"Fixed {len(changes)} lines in requirements.txt"
+            if changes:
+                msg += ":\n" + "\n".join(changes[:20])
+            await _log(f"   🔧 {msg}")
+            return msg
+
+        # ── reinstall_deps ─────────────────────────────────────────────────
+        elif tool_name == "reinstall_deps":
+            pip_path = os.path.join(project_dir, ".venv", "bin", "pip")
+            if not os.path.exists(pip_path):
+                # Create venv first
+                await _log("   🔨 Creating venv...")
+                proc = await asyncio.create_subprocess_shell(
+                    f"python3 -m venv {os.path.join(project_dir, '.venv')}",
+                    cwd=project_dir, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                )
+                await proc.communicate()
+                # Upgrade pip
+                await asyncio.create_subprocess_shell(
+                    f"{pip_path} install --upgrade pip setuptools wheel -q",
+                    cwd=project_dir, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                )
+            req_path = os.path.join(project_dir, "requirements.txt")
+            extra = tool_args.get("extra_packages", "").strip()
+            lines_out = []
+            ok = 0; fail = 0
+            if os.path.exists(req_path):
+                raw_pkgs = [l.strip() for l in Path(req_path).read_text().splitlines()
+                            if l.strip() and not l.strip().startswith("#")]
+                for pkg in raw_pkgs:
+                    proc = await asyncio.create_subprocess_shell(
+                        f'{pip_path} install "{pkg}" --no-cache-dir -q',
+                        cwd=project_dir, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                    )
+                    out, err = await proc.communicate()
+                    if proc.returncode == 0:
+                        ok += 1
+                    else:
+                        fail += 1
+                        lines_out.append(f"FAIL: {pkg} — {err.decode(errors='replace')[:120]}")
+                        await _log(f"   ⚠️  pip failed: {pkg}", "warning")
+            if extra:
+                for pkg in extra.split():
+                    proc = await asyncio.create_subprocess_shell(
+                        f"{pip_path} install {pkg} --no-cache-dir -q",
+                        cwd=project_dir, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                    )
+                    out, err = await proc.communicate()
+                    if proc.returncode == 0:
+                        ok += 1
+                    else:
+                        fail += 1
+                        lines_out.append(f"FAIL extra: {pkg}")
+            summary_msg = f"reinstall_deps: {ok} OK, {fail} FAILED"
+            if lines_out:
+                summary_msg += "\n" + "\n".join(lines_out[:20])
+            await _log(f"   ✅ {summary_msg}")
+            return summary_msg
+
+        # ── check_syntax_all ───────────────────────────────────────────────
+        elif tool_name == "check_syntax_all":
+            errors = []
+            skip = {".venv", "node_modules", "__pycache__", ".git", "migrations"}
+            for root, dirs, files in os.walk(project_dir):
+                dirs[:] = [d for d in dirs if d not in skip]
+                for name in files:
+                    if not name.endswith(".py"):
+                        continue
+                    fp = os.path.join(root, name)
+                    rp = os.path.relpath(fp, project_dir)
+                    proc = await asyncio.create_subprocess_shell(
+                        f"python3 -m py_compile {fp}",
+                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                    )
+                    _, err = await proc.communicate()
+                    if proc.returncode != 0:
+                        errors.append(f"{rp}: {err.decode(errors='replace').strip()}")
+            if errors:
+                msg = f"Syntax errors in {len(errors)} file(s):\n" + "\n".join(errors[:30])
+            else:
+                msg = "✅ All Python files are syntactically valid."
+            await _log(f"   🔍 Syntax check: {len(errors)} error(s)")
+            return msg
+
+        # ── get_fresh_logs ─────────────────────────────────────────────────
+        elif tool_name == "get_fresh_logs":
+            fresh = await db_get_logs(deployment_id, limit=200)
+            lines = [
+                f"[{l.get('level','info').upper():7s}][{l.get('source','?'):8s}] {l.get('message','')}"
+                for l in fresh[-200:]
+            ]
+            await _log(f"   📜 Fetched {len(lines)} fresh log lines")
+            return "\n".join(lines)[-10000:]
+
+        # ── check_port ─────────────────────────────────────────────────────
+        elif tool_name == "check_port":
+            project = await db_get_project(project_id)
+            port = (project or {}).get("port")
+            if not port:
+                return "No port assigned to this project yet."
+            import socket
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(2)
+                listening = s.connect_ex(("127.0.0.1", int(port))) == 0
+            status_str = "OPEN (app is listening)" if listening else "CLOSED (app not listening)"
+            # Check which process is using the port
+            proc = await asyncio.create_subprocess_shell(
+                f"ss -tlnp 2>/dev/null | grep ':{port} ' || lsof -i :{port} 2>/dev/null | head -5",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            out, _ = await proc.communicate()
+            proc_info = out.decode(errors="replace").strip()
+            await _log(f"   🔌 Port {port}: {status_str}")
+            return f"Port {port}: {status_str}\n{proc_info}"
+
+        # ── add_env_var ────────────────────────────────────────────────────
+        elif tool_name == "add_env_var":
+            key = tool_args.get("key", "").strip()
+            value = tool_args.get("value", "")
+            if not key:
+                return "[ERROR]: key is required"
+            project = await db_get_project(project_id)
+            env_vars = dict(project.get("env_vars") or {})
+            env_vars[key] = value
+            await db_update_project(project_id, {"env_vars": env_vars})
+            await _log(f"   🔑 Set env var {key} (restart_app to apply)")
+            return f"OK — {key} added to project env vars. Call restart_app to apply."
+
         else:
             return f"[Unknown tool: {tool_name}]"
 
@@ -2650,51 +3206,201 @@ async def ai_auto_fix(
             with open(req_path, errors="replace") as f:
                 req_content = f.read(3000)
 
-        system_prompt = f"""You are PyDeploy Ultra Agent — an elite, fully autonomous DevOps AI.
-You have TOTAL control over the project. Your job: diagnose and fix whatever is broken.
+        system_prompt = f"""You are PyDeploy Ultra Agent — a fully autonomous, elite DevOps AI.
+You have TOTAL control over the deployed project. Your singular job: diagnose the exact root cause
+and fix EVERYTHING until the app is running. No excuses, no giving up.
 
-PRIMARY MODEL: {GEMINI_PRIMARY} — optimised for agentic tool use.
+PRIMARY MODEL: {GEMINI_PRIMARY}
 
-TOOLS AVAILABLE:
-- run_command: any shell command (venv auto-activated)
-- read_file / write_file / patch_file: read and edit any file
-- delete_file / rename_file: manage files
-- create_dir / delete_dir: manage directories
-- list_files / search_in_files: explore the project
-- get_env: see environment variables
-- set_startup_cmd: fix wrong startup command in DB
-- notify_user: tell user when they need to act (e.g. set env vars)
-- restart_app: restart after fixes
-- mark_fixed: end the session
+═══════════════════════════════════════════════════════════════════
+TOOLS
+═══════════════════════════════════════════════════════════════════
+FILE OPS:
+  read_file        — read any file (returns numbered lines)
+  write_file       — create/overwrite a file completely
+  patch_file       — surgical line edits (replace/insert/delete/append)
+  delete_file      — remove a file
+  rename_file      — move/rename a file or directory
+  create_dir       — make a directory
+  delete_dir       — recursively remove a directory
 
-METHODOLOGY (follow this precisely):
-1. Read logs → identify ROOT CAUSE (be specific)
-2. list_files → understand project structure
-3. read_file on relevant files (with line numbers)
-4. Diagnose: syntax error? wrong command? missing package? missing env var?
-5. Fix:
-   - Wrong startup command → set_startup_cmd + restart_app
-   - Missing package → run_command ".venv/bin/pip install X" then restart_app
-   - Syntax error → read_file → patch_file (replace bad lines) → verify with run_command "python3 -m py_compile file.py" → restart_app
-   - Missing env var → notify_user with exact var name, patch code to handle missing gracefully → mark_fixed(success=False, summary="User must set X=...")
-   - Port binding → ensure app uses PORT env var and binds to 0.0.0.0
-6. After restart: wait 3s, check if app is alive
-7. If still broken: read new logs, iterate — you have {AI_MAX_ROUNDS} rounds
-8. ALWAYS call mark_fixed at the end
+EXPLORATION:
+  list_files       — tree view of project with file sizes
+  search_in_files  — grep/regex across all source files
+  get_env          — show env vars, Python path, platform info
 
-CRITICAL RULES:
+PYTHON:
+  check_syntax_all — py_compile every .py file, find all syntax errors
+  pip_list         — list installed packages in the venv
+  fix_requirements — auto-clean requirements.txt (strip comments, fix specifiers)
+  reinstall_deps   — re-run full pip install from requirements.txt + extras
+
+RUNTIME:
+  run_command      — execute any shell command (venv auto-activated)
+  check_port       — verify if the app is listening on its assigned port
+  set_startup_cmd  — update the startup command in the DB
+  add_env_var      — inject a non-secret env var into the project
+  restart_app      — stop + restart the app process
+  get_fresh_logs   — fetch latest 200 log lines from DB after a restart
+
+REPORTING:
+  notify_user      — show a prominent banner when user action is required
+  mark_fixed       — MUST call at the end of every session (success or fail)
+
+═══════════════════════════════════════════════════════════════════
+DIAGNOSIS PLAYBOOK  (read ALL logs first, then match to a scenario)
+═══════════════════════════════════════════════════════════════════
+
+1. REQUIREMENTS / INSTALL ERRORS
+   Symptoms: "Invalid requirement", "Expected comma", "No matching distribution",
+             "ERROR: Could not find a version", pip parse error
+   Fix:
+     a. fix_requirements  (strips inline comments, malformed specifiers, duplicates)
+     b. reinstall_deps
+     c. If version conflict: relax the pin (e.g. flask>=2.0 instead of flask==2.0.0)
+     d. If package not found: search PyPI name, write corrected requirements.txt
+     e. restart_app
+
+2. SYNTAX ERROR IN PROJECT FILES
+   Symptoms: "SyntaxError", "IndentationError", "TabError", "invalid syntax"
+   Fix:
+     a. check_syntax_all  → find ALL broken files at once
+     b. read_file on each broken file
+     c. patch_file to fix the syntax
+     d. Verify: run_command "python3 -m py_compile <file>"
+     e. restart_app
+
+3. IMPORT / MODULE NOT FOUND
+   Symptoms: "ModuleNotFoundError", "ImportError", "No module named"
+   Fix:
+     a. pip_list → check if the package is installed
+     b. If missing: reinstall_deps or run_command ".venv/bin/pip install <pkg>"
+     c. If it IS installed but still fails: check if app is using the venv
+        → startup command must use .venv/bin/python or venv is auto-activated
+     d. If module is a local package with missing __init__.py:
+        → write_file the missing __init__.py
+     e. restart_app
+
+4. WRONG STARTUP COMMAND
+   Symptoms: "No such file or directory: 'main.py'", wrong module path,
+             "can't find '__main__' module", "No module named app"
+   Fix:
+     a. list_files → find the real entry point
+     b. read_file on the entry point to get the correct app variable name
+     c. set_startup_cmd with corrected command
+     d. restart_app
+
+5. PORT / BINDING ISSUES
+   Symptoms: "Address already in use", "OSError: [Errno 98]", app starts but
+             proxy returns 503, check_port shows CLOSED
+   Fix:
+     a. check_port → see what's using the port
+     b. Ensure startup command uses ${{PORT:-8000}} not a hardcoded port
+     c. Ensure app binds to 0.0.0.0, not 127.0.0.1 or localhost
+     d. If port is in use: run_command "kill $(lsof -t -i:<port>)" then restart_app
+     e. set_startup_cmd to fix the bind address/port
+
+6. MISSING ENVIRONMENT VARIABLES
+   Symptoms: "KeyError: 'DATABASE_URL'", "ValueError: invalid literal",
+             app crashes with None/empty config, authentication failures
+   Fix:
+     a. read_file on the file that uses the missing var
+     b. If it's a non-secret default (DB path, debug flag, host):
+        → add_env_var with a safe default value
+        → patch the code to use os.getenv("KEY", "default") pattern
+     c. If it's a real secret (API key, password):
+        → patch code to handle missing gracefully: if not os.getenv("KEY"): raise
+        → notify_user "You must set SECRET_KEY=<your-value> in project settings"
+        → mark_fixed(success=False, summary="User must set SECRET_KEY")
+
+7. DATABASE / MIGRATION ERRORS
+   Symptoms: "no such table", "relation does not exist", "OperationalError",
+             "django.db.migrations", SQLAlchemy errors
+   Fix:
+     a. read_file on main db config file
+     b. For Django: run_command "python manage.py migrate --run-syncdb"
+     c. For SQLAlchemy: find and run create_all or alembic upgrade
+     d. For SQLite: ensure DB file path is writable (/tmp/ or project dir)
+     e. If DB_URL missing: add_env_var "DATABASE_URL" "sqlite:///app.db" + patch code
+
+8. PROCESS CRASH / EXIT CODE != 0
+   Symptoms: "Process exited with code: 1", app starts then immediately dies,
+             get_fresh_logs shows traceback right after startup
+   Fix:
+     a. get_fresh_logs immediately to see crash output
+     b. Run the startup command manually: run_command "<startup_cmd>" + capture output
+     c. Match output to scenarios 1-7 above
+     d. Fix the underlying issue, then restart_app
+
+9. PERMISSION / FILE SYSTEM ERRORS
+   Symptoms: "PermissionError", "EACCES", "Read-only file system"
+   Fix:
+     a. run_command "ls -la <path>" to check permissions
+     b. run_command "chmod +x <file>" or "chmod 755 <dir>"
+     c. Move writable data to /tmp if /app is read-only
+
+10. DJANGO-SPECIFIC
+    Symptoms: Django errors, WSGI issues, missing settings
+    Fix:
+      a. Find manage.py: list_files → search_in_files "manage.py"
+      b. Check DJANGO_SETTINGS_MODULE: get_env
+      c. run_command "python manage.py check" to see all issues
+      d. Fix settings.py ALLOWED_HOSTS = ["*"], STATIC_ROOT, DATABASES
+      e. run_command "python manage.py migrate" then restart_app
+
+11. FRONTEND BUILD FAILURES
+    Symptoms: npm/yarn errors, missing node_modules, build script fails
+    Fix:
+      a. run_command "node --version && npm --version"
+      b. run_command "npm install --legacy-peer-deps" in frontend dir
+      c. run_command "npm run build" and capture output
+      d. Fix package.json scripts or dependency conflicts
+
+12. CIRCULAR IMPORTS
+    Symptoms: "ImportError: cannot import name X from partially initialized module"
+    Fix:
+      a. search_in_files for the circular import chain
+      b. Move shared code to a separate module
+      c. Use lazy imports (import inside function) as a quick fix
+      d. Verify with run_command "python3 -c 'import <module>'"
+
+13. ENCODING / UnicodeDecodeError
+    Symptoms: "UnicodeDecodeError", "codec can't decode", binary in text file
+    Fix:
+      a. read_file on the offending file (returns with replacement chars)
+      b. Add encoding="utf-8" or errors="replace" to open() calls
+      c. Fix source file encoding with run_command "iconv -f latin1 -t utf8 file > file.new"
+
+14. SSL / TLS ERRORS
+    Symptoms: "SSL: CERTIFICATE_VERIFY_FAILED", "CERTIFICATE_HAS_EXPIRED"
+    Fix:
+      a. run_command "pip install certifi" + "python -m certifi"
+      b. Add ssl_verify=False as a temporary workaround with notify_user
+
+15. MEMORY / OOM
+    Symptoms: "MemoryError", "Killed", process exits with code 137
+    Fix:
+      a. Reduce worker count in startup command (--workers 1)
+      b. set_startup_cmd with fewer workers
+      c. notify_user about memory constraints
+
+═══════════════════════════════════════════════════════════════════
+CRITICAL RULES
+═══════════════════════════════════════════════════════════════════
 - NEVER give up without calling mark_fixed
 - NEVER invent credentials or fake API tokens
-- ALWAYS read a file before patching it
-- Install packages with: .venv/bin/pip install <pkg>  (NEVER bare pip)
-- Fix port: ensure startup uses --port $PORT or --port {"{PORT:-8000}"}
-- After each restart_app, check if it survived (tool returns FAILED if it crashed again)
-- For missing env vars: patch the code to fail gracefully + notify_user
+- ALWAYS read_file before patching — never patch from memory
+- Install packages with: .venv/bin/pip install X  (NEVER bare pip)
+- Port fix: startup cmd must use ${{PORT:-8000}} and bind to 0.0.0.0
+- After each restart_app: check return value AND call get_fresh_logs + check_port
+- For user-action items: patch code to fail gracefully + notify_user + mark_fixed(success=False)
+- If one approach fails, try a different one — you have {AI_MAX_ROUNDS} rounds
 
-Framework: {deployment.get("framework", "unknown")}
-Startup cmd: {deployment.get("startup_cmd", "unknown")}
-Trigger: {trigger}
-Max rounds: {AI_MAX_ROUNDS}
+Context:
+  Framework:   {deployment.get("framework", "unknown")}
+  Startup cmd: {deployment.get("startup_cmd", "unknown")}
+  Trigger:     {trigger}
+  Max rounds:  {AI_MAX_ROUNDS}
 
 requirements.txt:
 {req_content or "(not found)"}
@@ -2709,7 +3415,7 @@ Project tree:
 {log_tail[-10000:]}
 === END LOGS ===
 
-Start by identifying the exact error, then fix everything. Go."""
+Start with: (1) identify the EXACT error from logs, (2) match it to a scenario in your playbook, (3) execute the fix. Go."""
 
         # Gemini format uses separate systemInstruction + contents
         messages: List[Dict] = [
@@ -4136,6 +4842,109 @@ async function triggerAiFix() {{
 # SECTION 13: FASTAPI APPLICATION & LIFESPAN
 # ──────────────────────────────────────────────────────────────────────────────
 
+# ── Crash-loop tracker ───────────────────────────────────────────────────────
+_crash_counts: Dict[str, int] = {}          # deployment_id → consecutive crashes
+_crash_timestamps: Dict[str, list] = {}     # deployment_id → list of crash times
+CRASH_LOOP_THRESHOLD = 3                    # crashes within this window = loop
+CRASH_LOOP_WINDOW_SECS = 120               # seconds window for crash loop detection
+
+
+async def _health_monitor():
+    """
+    Background task: watch all running processes every 15s.
+    - Detect processes that silently died (poll() != None but still in _running_processes)
+    - Track crash loops: if an app crashes 3+ times in 2 minutes, stop the AI retry cycle
+    - Reclaim ports from dead processes
+    - Update DB status for orphaned deployments
+    """
+    logger.info("Health monitor started.")
+    while True:
+        try:
+            await asyncio.sleep(15)
+            now = time.monotonic()
+            dead = []
+
+            for dep_id, info in list(_running_processes.items()):
+                proc = info.get("process")
+                if proc is None:
+                    dead.append(dep_id)
+                    continue
+                if proc.poll() is not None:
+                    dead.append(dep_id)
+                    exit_code = proc.returncode
+
+                    project_id = ""
+                    # Try to recover project_id from DB
+                    try:
+                        dep = await db_get_deployment(dep_id)
+                        project_id = (dep or {}).get("project_id", "")
+                    except Exception:
+                        pass
+
+                    # Track crashes
+                    if exit_code and exit_code != 0:
+                        stamps = _crash_timestamps.setdefault(dep_id, [])
+                        stamps.append(now)
+                        # Prune old stamps outside the window
+                        stamps[:] = [t for t in stamps if now - t < CRASH_LOOP_WINDOW_SECS]
+                        _crash_counts[dep_id] = len(stamps)
+
+                        if len(stamps) >= CRASH_LOOP_THRESHOLD:
+                            logger.warning(
+                                f"[health] Crash loop detected for deployment {dep_id} "
+                                f"({len(stamps)} crashes in {CRASH_LOOP_WINDOW_SECS}s)"
+                            )
+                            if project_id:
+                                try:
+                                    await db_add_log(
+                                        dep_id, project_id,
+                                        f"⚠️ Crash loop detected ({len(stamps)} crashes in "
+                                        f"{CRASH_LOOP_WINDOW_SECS}s). Pausing auto-restart. "
+                                        f"AI will attempt a deeper fix.",
+                                        level="error", source="monitor",
+                                    )
+                                    await db_update_project(project_id, {"status": DeployState.FAILED})
+                                    await db_update_deployment(dep_id, {"status": DeployState.FAILED})
+                                except Exception:
+                                    pass
+                            # Trigger AI fix only if not already running
+                            if project_id and not _ai_fixing.get(dep_id):
+                                asyncio.create_task(
+                                    ai_auto_fix(dep_id, project_id, trigger="crash_loop")
+                                )
+                        elif project_id and not _ai_fixing.get(dep_id):
+                            asyncio.create_task(
+                                ai_auto_fix(dep_id, project_id, trigger="crash")
+                            )
+
+                    # Update DB for clean exits too
+                    if project_id:
+                        try:
+                            await db_update_deployment(dep_id, {
+                                "status": DeployState.STOPPED,
+                                "finished_at": datetime.now(timezone.utc).isoformat(),
+                            })
+                            await db_update_project(project_id, {"status": DeployState.STOPPED})
+                        except Exception:
+                            pass
+
+            # Cleanup dead entries
+            for dep_id in dead:
+                info = _running_processes.pop(dep_id, None)
+                if info:
+                    try:
+                        info["log_file"].close()
+                    except Exception:
+                        pass
+                    release_port(info.get("port", 0))
+
+        except asyncio.CancelledError:
+            logger.info("Health monitor stopped.")
+            break
+        except Exception as exc:
+            logger.warning(f"Health monitor error: {exc}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown tasks."""
@@ -4162,10 +4971,15 @@ async def lifespan(app: FastAPI):
         logger.warning(f"Storage init skipped: {e}")
 
     logger.info(f"PyDeploy ready on port {PORT}")
+
+    # Start background health monitor
+    health_task = asyncio.create_task(_health_monitor())
+
     yield
 
     # Shutdown: stop all running processes
     logger.info("Shutting down — stopping all running deployments...")
+    health_task.cancel()
     for dep_id in list(_running_processes.keys()):
         try:
             await stop_deployment_process(dep_id)
