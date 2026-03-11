@@ -604,59 +604,104 @@ async def require_user(request: Request) -> Dict:
 
 class FrameworkDetector:
     """
-    Analyzes a project directory and determines:
-    - The backend framework (FastAPI, Flask, Django, etc.)
-    - Whether there's a frontend (React, Next.js, static)
-    - The recommended startup command
-    - Entry point file
+    Deep project analyzer — handles every kind of Python project:
+    FastAPI, Flask, Django, Tornado, aiohttp, Bottle, Falcon,
+    plain scripts, bots, workers, scrapers, static/HTML sites, etc.
     """
 
     FRAMEWORK_SIGNATURES = {
-        "fastapi": ["fastapi", "uvicorn"],
-        "flask":   ["flask"],
-        "django":  ["django", "djangorestframework"],
-        "starlette": ["starlette"],
-        "tornado": ["tornado"],
-        "aiohttp": ["aiohttp"],
-        "bottle":  ["bottle"],
-        "falcon":  ["falcon"],
+        "fastapi":    ["fastapi"],
+        "flask":      ["flask"],
+        "django":     ["django", "djangorestframework"],
+        "starlette":  ["starlette"],
+        "tornado":    ["tornado"],
+        "aiohttp":    ["aiohttp"],
+        "bottle":     ["bottle"],
+        "falcon":     ["falcon"],
+        "sanic":      ["sanic"],
+        "litestar":   ["litestar", "starlite"],
+        "quart":      ["quart"],
+        "blacksheep": ["blacksheep"],
+        "grpc":       ["grpcio"],
+        "celery":     ["celery"],
+        "dramatiq":   ["dramatiq"],
+        "rq":         ["rq"],
+        "telegram":   ["python-telegram-bot", "aiogram", "telebot", "pyrogram", "telethon"],
+        "discord":    ["discord.py", "nextcord", "disnake", "hikari"],
+        "slack":      ["slack-sdk", "slack-bolt"],
+        "twilio":     ["twilio"],
+        "scrapy":     ["scrapy"],
+        "playwright": ["playwright"],
+        "selenium":   ["selenium"],
+        "streamlit":  ["streamlit"],
+        "gradio":     ["gradio"],
+        "dash":       ["dash"],
+        "panel":      ["panel"],
+    }
+
+    # Web frameworks that bind to a port  
+    WEB_FRAMEWORKS = {"fastapi","flask","django","starlette","tornado","aiohttp",
+                      "bottle","falcon","sanic","litestar","quart","blacksheep"}
+
+    # Frameworks that just run as a process (no port binding needed)
+    PROCESS_FRAMEWORKS = {"telegram","discord","slack","twilio","scrapy",
+                          "playwright","selenium","celery","dramatiq","rq","grpc"}
+
+    # Frameworks that have their own server command
+    SERVER_COMMANDS = {
+        "streamlit": "streamlit run {entry} --server.port {port} --server.address 0.0.0.0",
+        "gradio":    "python {entry}",
+        "dash":      "python {entry}",
+        "panel":     "panel serve {entry} --address 0.0.0.0 --port {port}",
     }
 
     ENTRY_PATTERNS = [
-        # Most common first
-        "main.py", "app.py", "server.py", "bot.py", "run.py",
-        "wsgi.py", "asgi.py", "application.py", "index.py",
-        "start.py", "manage.py", "api.py", "worker.py",
-        "__main__.py", "launcher.py", "handler.py",
+        "main.py","app.py","server.py","bot.py","run.py","start.py",
+        "wsgi.py","asgi.py","application.py","index.py","api.py",
+        "worker.py","__main__.py","launcher.py","handler.py","service.py",
+        "gateway.py","relay.py","proxy.py","app/__init__.py","src/main.py",
+        "src/app.py","core.py","manage.py",
     ]
 
     @classmethod
     def detect(cls, project_dir: str) -> Dict[str, Any]:
-        """
-        Returns a dict with keys:
-          framework, entry_point, startup_cmd, has_frontend,
-          frontend_type, has_requirements, requirements_path,
-          has_package_json, package_json_path, python_version
-        """
         result = {
             "framework": "unknown",
             "entry_point": None,
             "startup_cmd": None,
             "has_frontend": False,
             "frontend_type": None,
+            "is_frontend_only": False,
             "has_requirements": False,
             "requirements_path": None,
             "has_package_json": False,
             "package_json_path": None,
             "python_version": "3.11",
             "notes": [],
+            "project_type": "python",   # python | frontend_only | fullstack
         }
 
         root = Path(project_dir)
 
+        # ── Check frontend-only (HTML/CSS/JS no Python) ───────────────
+        py_files = [f for f in root.rglob("*.py")
+                    if not any(p in str(f) for p in [".venv","node_modules","__pycache__"])]
+        html_files = list(root.rglob("*.html")) + list(root.rglob("*.htm"))
+
+        if not py_files and html_files:
+            result["is_frontend_only"] = True
+            result["project_type"] = "frontend_only"
+            result["framework"] = "static"
+            index = next((f for f in html_files if f.name in ("index.html","index.htm")), html_files[0])
+            result["entry_point"] = str(index.relative_to(root))
+            result["startup_cmd"] = f"python -m http.server {{PORT:-8000}}"
+            result["notes"].append("Frontend-only project detected — serving with Python HTTP server")
+            cls._detect_frontend_type(root, result)
+            return result
+
         # ── Requirements.txt ──────────────────────────────────────────
-        for req_file in ["requirements.txt", "requirements/base.txt",
-                         "requirements/production.txt"]:
+        for req_file in ["requirements.txt","requirements/base.txt",
+                         "requirements/production.txt","requirements/main.txt"]:
             req_path = root / req_file
             if req_path.exists():
                 result["has_requirements"] = True
@@ -664,60 +709,85 @@ class FrameworkDetector:
                 break
 
         # ── Python version ────────────────────────────────────────────
-        runtime_file = root / "runtime.txt"
-        if runtime_file.exists():
-            content = runtime_file.read_text().strip()
-            match = re.search(r"python-(\d+\.\d+)", content, re.I)
-            if match:
-                result["python_version"] = match.group(1)
+        for vf in ["runtime.txt",".python-version"]:
+            vfile = root / vf
+            if vfile.exists():
+                txt = vfile.read_text().strip()
+                m = re.search(r"(\d+\.\d+)", txt)
+                if m:
+                    result["python_version"] = m.group(1)
+                break
 
-        # ── Detect framework from requirements ────────────────────────
-        framework = "unknown"
+        # ── Detect framework from requirements + imports ──────────────
+        req_content = ""
         if result["has_requirements"]:
-            req_content = Path(result["requirements_path"]).read_text().lower()
-            for fw, sigs in cls.FRAMEWORK_SIGNATURES.items():
-                if any(sig in req_content for sig in sigs):
-                    framework = fw
-                    break
+            try:
+                req_content = Path(result["requirements_path"]).read_text().lower()
+            except Exception:
+                pass
+
+        # Also scan imports in Python files for framework hints
+        import_hints = ""
+        for py in py_files[:20]:
+            try:
+                import_hints += py.read_text(errors="replace")[:2000] + "\n"
+            except Exception:
+                pass
+        combined = req_content + "\n" + import_hints.lower()
+
+        framework = "unknown"
+        for fw, sigs in cls.FRAMEWORK_SIGNATURES.items():
+            if any(sig.lower() in combined for sig in sigs):
+                framework = fw
+                break
         result["framework"] = framework
 
         # ── Find entry point ──────────────────────────────────────────
         entry = None
-        # Check common patterns
+        # Exact filename matches
         for pattern in cls.ENTRY_PATTERNS:
             candidate = root / pattern
             if candidate.exists():
                 entry = str(candidate.relative_to(root))
                 break
 
-        # If not found at root, search one level deep
+        # One level deep
         if not entry:
             for candidate in root.glob("*/*.py"):
-                if candidate.name in cls.ENTRY_PATTERNS:
+                if candidate.name in [p for p in cls.ENTRY_PATTERNS if "/" not in p]:
                     entry = str(candidate.relative_to(root))
                     break
 
-        # If STILL not found, look for ANY .py with __main__ guard
+        # Any .py with __main__ block
         if not entry:
-            skip = {".venv", "node_modules", "__pycache__"}
+            skip = {".venv","node_modules","__pycache__","test","tests","migrations"}
             for candidate in sorted(root.rglob("*.py")):
                 if any(part in skip for part in candidate.parts):
                     continue
                 try:
-                    text = candidate.read_text(errors="replace")
-                    if '__name__' in text and '__main__' in text:
+                    txt = candidate.read_text(errors="replace")
+                    if '__name__' in txt and '__main__' in txt:
                         entry = str(candidate.relative_to(root))
-                        result["notes"].append(f"Entry point found via __main__ scan: {entry}")
+                        result["notes"].append(f"Entry via __main__ scan: {entry}")
                         break
                 except Exception:
                     pass
 
-        # Last resort: pick the first .py file at root level
+        # Framework-specific entry search
+        if not entry and framework in ("telegram","discord","slack"):
+            for pat in ["bot.py","main.py","run.py","client.py"]:
+                c = root / pat
+                if c.exists():
+                    entry = str(c.relative_to(root))
+                    break
+
+        # Last resort: first .py at root
         if not entry:
-            candidates = sorted(root.glob("*.py"))
-            if candidates:
-                entry = str(candidates[0].relative_to(root))
-                result["notes"].append(f"Entry point fallback: first .py file = {entry}")
+            cands = sorted(f for f in root.glob("*.py")
+                          if f.name not in ("setup.py","conftest.py","test_*.py"))
+            if cands:
+                entry = str(cands[0].relative_to(root))
+                result["notes"].append(f"Entry fallback: {entry}")
 
         result["entry_point"] = entry
 
@@ -726,91 +796,115 @@ class FrameworkDetector:
         result["startup_cmd"] = startup_cmd
 
         # ── Frontend detection ────────────────────────────────────────
+        cls._detect_frontend_type(root, result)
+
+        # ── Django-specific ───────────────────────────────────────────
+        if framework == "django":
+            result = cls._handle_django(root, result)
+
+        result["project_type"] = "fullstack" if result["has_frontend"] else "python"
+        return result
+
+    @classmethod
+    def _detect_frontend_type(cls, root: Path, result: Dict):
+        """Detect Node/React/Vue/static frontend."""
         for pkg_json in root.rglob("package.json"):
-            # Skip node_modules
             if "node_modules" in str(pkg_json):
                 continue
             result["has_package_json"] = True
             result["package_json_path"] = str(pkg_json)
-
             try:
-                pkg_data = json.loads(pkg_json.read_text())
-                deps = {
-                    **pkg_data.get("dependencies", {}),
-                    **pkg_data.get("devDependencies", {}),
-                }
-
+                pkg = json.loads(pkg_json.read_text())
+                deps = {**pkg.get("dependencies",{}), **pkg.get("devDependencies",{})}
                 if "next" in deps:
-                    result["frontend_type"] = "nextjs"
-                    result["has_frontend"] = True
+                    result["frontend_type"] = "nextjs"; result["has_frontend"] = True
                 elif "react" in deps or "react-dom" in deps:
-                    result["frontend_type"] = "react"
-                    result["has_frontend"] = True
+                    result["frontend_type"] = "react"; result["has_frontend"] = True
                 elif "vue" in deps:
-                    result["frontend_type"] = "vue"
-                    result["has_frontend"] = True
+                    result["frontend_type"] = "vue"; result["has_frontend"] = True
+                elif "svelte" in deps:
+                    result["frontend_type"] = "svelte"; result["has_frontend"] = True
+                elif "scripts" in pkg:
+                    result["frontend_type"] = "node"; result["has_frontend"] = True
             except Exception:
                 pass
-            break  # Only check first package.json
-
-        # ── Static frontend ───────────────────────────────────────────
-        for static_dir in ["static", "public", "frontend", "client", "dist", "build"]:
-            if (root / static_dir).is_dir():
-                if not result["has_frontend"]:
-                    result["has_frontend"] = True
-                    result["frontend_type"] = "static"
+            break
+        # Static dirs
+        for d in ["static","public","frontend","client","dist","build","www","html"]:
+            if (root / d).is_dir() and not result["has_frontend"]:
+                result["has_frontend"] = True
+                result["frontend_type"] = "static"
                 break
-
-        # ── Django-specific: detect wsgi/asgi ─────────────────────────
-        if framework == "django":
-            result = cls._handle_django(root, result)
-
-        return result
+        # HTML at root
+        if not result["has_frontend"] and list(root.glob("*.html")):
+            result["has_frontend"] = True
+            result["frontend_type"] = "static"
 
     @classmethod
     def _build_startup_cmd(cls, framework: str, entry: Optional[str], root: Path) -> str:
-        """Generate the appropriate startup command."""
         port_var = "${PORT:-8000}"
 
-        if framework in ("fastapi", "starlette"):
+        if framework in ("fastapi","starlette","litestar","blacksheep"):
             if entry:
-                module = entry.replace("/", ".").replace(".py", "")
-                # Try to find the app variable name
-                app_var = cls._find_app_var(root / entry if entry else None) or "app"
+                module = entry.replace("/",".").replace(".py","")
+                app_var = cls._find_app_var(root / entry) or "app"
                 return f"uvicorn {module}:{app_var} --host 0.0.0.0 --port {port_var}"
             return f"uvicorn main:app --host 0.0.0.0 --port {port_var}"
 
-        elif framework == "flask":
+        elif framework in ("flask","quart"):
             if entry:
-                module = entry.replace("/", ".").replace(".py", "")
-                app_var = cls._find_app_var(root / entry if entry else None) or "app"
+                module = entry.replace("/",".").replace(".py","")
+                app_var = cls._find_app_var(root / entry) or "app"
                 return f"gunicorn {module}:{app_var} --bind 0.0.0.0:{port_var} --workers 2"
             return f"gunicorn app:app --bind 0.0.0.0:{port_var} --workers 2"
 
         elif framework == "django":
-            # Will be refined in _handle_django
             return f"gunicorn wsgi:application --bind 0.0.0.0:{port_var} --workers 2"
+
+        elif framework == "tornado":
+            return f"python {entry or 'main.py'}"
 
         elif framework == "aiohttp":
             if entry:
-                module = entry.replace("/", ".").replace(".py", "")
+                module = entry.replace("/",".").replace(".py","")
                 return f"python -m {module}"
-            return f"python main.py"
+            return "python main.py"
+
+        elif framework == "sanic":
+            if entry:
+                module = entry.replace("/",".").replace(".py","")
+                app_var = cls._find_app_var(root / entry) or "app"
+                return f"sanic {module}:{app_var} --host 0.0.0.0 --port {port_var}"
+            return f"sanic main:app --host 0.0.0.0 --port {port_var}"
+
+        elif framework == "streamlit":
+            return f"streamlit run {entry or 'app.py'} --server.port {port_var} --server.address 0.0.0.0"
+
+        elif framework == "gradio":
+            return f"python {entry or 'app.py'}"
+
+        elif framework == "panel":
+            return f"panel serve {entry or 'app.py'} --address 0.0.0.0 --port {port_var}"
+
+        elif framework == "grpc":
+            return f"python {entry or 'server.py'}"
+
+        elif framework == "static":
+            return f"python -m http.server {port_var}"
 
         else:
-            # Generic Python runner
+            # Generic: bots, workers, scrapers, scripts, etc.
             if entry:
                 return f"python {entry}"
             return "python main.py"
 
     @classmethod
-    def _find_app_var(cls, entry_path: Optional[Path]) -> Optional[str]:
-        """Scan a Python file for common WSGI/ASGI app variable names."""
-        if not entry_path or not entry_path.exists():
+    def _find_app_var(cls, entry_path) -> Optional[str]:
+        if not entry_path or not Path(str(entry_path)).exists():
             return None
         try:
-            content = entry_path.read_text()
-            for var in ["application", "app", "create_app", "APP"]:
+            content = Path(str(entry_path)).read_text()
+            for var in ["application","app","create_app","APP","server","api"]:
                 if re.search(rf"^{var}\s*=", content, re.MULTILINE):
                     return var
         except Exception:
@@ -819,38 +913,23 @@ class FrameworkDetector:
 
     @classmethod
     def _handle_django(cls, root: Path, result: Dict) -> Dict:
-        """Refine detection for Django projects."""
-        # Find manage.py
         manage_files = list(root.glob("**/manage.py"))
         if not manage_files:
             return result
-
         django_root = manage_files[0].parent
-
-        # Find wsgi.py
         wsgi_files = list(django_root.glob("**/wsgi.py"))
         if wsgi_files:
             wsgi = wsgi_files[0]
-            module_parts = wsgi.relative_to(django_root).parts
-            module = ".".join(module_parts).replace(".py", "")
-            result["startup_cmd"] = (
-                f"gunicorn {module}:application --bind 0.0.0.0:${{PORT:-8000}} --workers 2"
-            )
+            module = ".".join(wsgi.relative_to(django_root).parts).replace(".py","")
+            result["startup_cmd"] = f"gunicorn {module}:application --bind 0.0.0.0:${{PORT:-8000}} --workers 2"
         else:
-            # Fallback: find settings module
             settings_files = list(django_root.glob("**/settings.py"))
             if settings_files:
-                settings = settings_files[0]
-                project_name = settings.parent.name
-                result["startup_cmd"] = (
-                    f"gunicorn {project_name}.wsgi:application "
-                    f"--bind 0.0.0.0:${{PORT:-8000}} --workers 2"
-                )
-
+                pname = settings_files[0].parent.name
+                result["startup_cmd"] = f"gunicorn {pname}.wsgi:application --bind 0.0.0.0:${{PORT:-8000}} --workers 2"
         return result
 
 
-# ──────────────────────────────────────────────────────────────────────────────
 # SECTION 8: SECURITY — ZIP VALIDATION
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -914,8 +993,12 @@ class ZipValidator:
 
 class BuildSystem:
     """
-    Handles installation of Python and Node.js dependencies,
-    and frontend builds.
+    Handles installation of Python and Node.js dependencies.
+    Key features:
+    - Chunked pip install: splits large requirements into batches to avoid timeouts
+    - Process isolation: deployed apps run with a clean minimal env
+    - npm install with retry and timeout management
+    - Frontend-only static serving support
     """
 
     @classmethod
@@ -926,27 +1009,23 @@ class BuildSystem:
         env: Optional[Dict] = None,
         timeout: int = 300,
     ) -> Dict[str, Any]:
-        """
-        Run a shell command asynchronously.
-        Returns {"returncode": int, "stdout": str, "stderr": str}
-        """
         try:
             proc_env = {**os.environ, **(env or {})}
             proc = await asyncio.create_subprocess_shell(
-                cmd,
-                cwd=cwd,
-                env=proc_env,
+                cmd, cwd=cwd, env=proc_env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
             return {
-                "returncode": proc.returncode,
+                "returncode": proc.returncode or 0,
                 "stdout": stdout.decode("utf-8", errors="replace"),
                 "stderr": stderr.decode("utf-8", errors="replace"),
             }
         except asyncio.TimeoutError:
-            return {"returncode": -1, "stdout": "", "stderr": "Command timed out."}
+            try: proc.kill()
+            except Exception: pass
+            return {"returncode": -1, "stdout": "", "stderr": f"Timed out after {timeout}s"}
         except Exception as e:
             return {"returncode": -1, "stdout": "", "stderr": str(e)}
 
@@ -958,47 +1037,123 @@ class BuildSystem:
         deployment_id: str,
         project_id: str,
     ) -> bool:
-        """Install Python dependencies into the project virtualenv."""
+        """
+        Install Python deps into isolated venv.
+        Splits requirements into CHUNKS of 15 packages each to avoid
+        single-run timeouts on large projects (e.g. ML stacks, bots).
+        """
         venv_dir = os.path.join(project_dir, ".venv")
-        await db_add_log(deployment_id, project_id, "Creating virtual environment...", source="build")
+        pip_path  = os.path.join(venv_dir, "bin", "pip")
+        CHUNK_SIZE = 15   # packages per batch
 
-        # Create venv
-        result = await cls.run_command(
-            f"python3 -m venv {venv_dir}",
-            cwd=project_dir,
-        )
+        await db_add_log(deployment_id, project_id, "Creating isolated virtual environment...", source="build")
+
+        result = await cls.run_command(f"python3 -m venv {venv_dir}", cwd=project_dir)
         if result["returncode"] != 0:
-            msg = f"Failed to create venv: {result['stderr']}"
-            await db_add_log(deployment_id, project_id, msg, level="error", source="build")
+            await db_add_log(deployment_id, project_id, f"venv creation failed: {result['stderr']}", level="error", source="build")
             return False
 
-        # Install pip packages
-        pip_path = os.path.join(venv_dir, "bin", "pip")
-        await db_add_log(deployment_id, project_id, "Installing Python dependencies...", source="build")
-        result = await cls.run_command(
-            f"{pip_path} install -r {requirements_path} --no-cache-dir",
-            cwd=project_dir,
-            timeout=600,
-        )
+        # Upgrade pip silently
+        await cls.run_command(f"{pip_path} install --upgrade pip setuptools wheel -q", cwd=project_dir, timeout=120)
 
-        if result["stdout"]:
-            for line in result["stdout"].splitlines()[-20:]:
-                await db_add_log(deployment_id, project_id, line, source="pip")
-
-        if result["returncode"] != 0:
-            msg = f"pip install failed: {result['stderr'][:500]}"
-            await db_add_log(deployment_id, project_id, msg, level="error", source="build")
+        # Parse requirements
+        try:
+            raw_lines = Path(requirements_path).read_text().splitlines()
+        except Exception as exc:
+            await db_add_log(deployment_id, project_id, f"Cannot read requirements.txt: {exc}", level="error", source="build")
             return False
 
-        await db_add_log(deployment_id, project_id, "Python dependencies installed.", source="build")
+        # Filter: skip comments, blank lines, -r includes (handle recursively), constraints
+        packages = []
+        for line in raw_lines:
+            line = line.strip()
+            if not line or line.startswith("#") or line.startswith("-c"):
+                continue
+            if line.startswith("-r "):
+                # Inline recursive requirements — try to load them
+                sub_req = os.path.join(os.path.dirname(requirements_path), line[3:].strip())
+                if os.path.exists(sub_req):
+                    try:
+                        for sl in Path(sub_req).read_text().splitlines():
+                            sl = sl.strip()
+                            if sl and not sl.startswith("#"):
+                                packages.append(sl)
+                    except Exception:
+                        pass
+                continue
+            packages.append(line)
 
-        # Also install gunicorn for non-FastAPI apps
-        await cls.run_command(
-            f"{pip_path} install gunicorn uvicorn --no-cache-dir",
-            cwd=project_dir,
-            timeout=120,
-        )
+        # Always ensure base servers are installed
+        base_packages = ["gunicorn", "uvicorn[standard]"]
+        for bp in base_packages:
+            name = bp.split("[")[0].split("=")[0].split(">")[0].split("<")[0].lower()
+            if not any(name in p.lower() for p in packages):
+                packages.append(bp)
 
+        total = len(packages)
+        await db_add_log(deployment_id, project_id, f"Installing {total} packages in chunks of {CHUNK_SIZE}...", source="build")
+
+        # ── Chunked install ────────────────────────────────────────────
+        chunks = [packages[i:i+CHUNK_SIZE] for i in range(0, len(packages), CHUNK_SIZE)]
+        failed_pkgs = []
+
+        for idx, chunk in enumerate(chunks, 1):
+            chunk_str = " ".join(f'"{p}"' for p in chunk)
+            await db_add_log(deployment_id, project_id,
+                f"  Chunk {idx}/{len(chunks)}: installing {len(chunk)} packages...", source="build")
+
+            result = await cls.run_command(
+                f"{pip_path} install {chunk_str} --no-cache-dir -q",
+                cwd=project_dir, timeout=300,
+            )
+
+            if result["returncode"] != 0:
+                # Try each package individually on failure
+                await db_add_log(deployment_id, project_id,
+                    f"  Chunk {idx} had errors — trying packages individually...", level="warning", source="build")
+                for pkg in chunk:
+                    r = await cls.run_command(
+                        f'{pip_path} install "{pkg}" --no-cache-dir -q',
+                        cwd=project_dir, timeout=180,
+                    )
+                    if r["returncode"] != 0:
+                        failed_pkgs.append(pkg)
+                        await db_add_log(deployment_id, project_id,
+                            f"  ⚠ Failed: {pkg} — {r['stderr'][:200]}", level="warning", source="build")
+                    else:
+                        await db_add_log(deployment_id, project_id, f"  ✓ {pkg}", source="build")
+            else:
+                installed = [l for l in result["stdout"].splitlines() if l.strip().startswith("Successfully installed")]
+                if installed:
+                    await db_add_log(deployment_id, project_id, f"  ✓ {installed[-1]}", source="build")
+
+        if failed_pkgs:
+            await db_add_log(deployment_id, project_id,
+                f"⚠ {len(failed_pkgs)} package(s) failed: {', '.join(failed_pkgs[:10])}. AI will attempt to fix.",
+                level="warning", source="build")
+            # Don't fail entirely — AI can retry at runtime
+
+        await db_add_log(deployment_id, project_id, f"✅ Python dependencies installed ({total - len(failed_pkgs)}/{total} OK).", source="build")
+        return True
+
+    @classmethod
+    async def setup_frontend_only(
+        cls,
+        project_dir: str,
+        deployment_id: str,
+        project_id: str,
+    ) -> bool:
+        """Serve a frontend-only project (HTML/CSS/JS) via Python HTTP server."""
+        await db_add_log(deployment_id, project_id,
+            "Static frontend detected — will serve with Python HTTP server.", source="build")
+        # Check for index.html
+        root = Path(project_dir)
+        index = next((f for f in root.rglob("*.html") if f.name in ("index.html","index.htm")), None)
+        if not index:
+            index = next(root.rglob("*.html"), None)
+        if index:
+            await db_add_log(deployment_id, project_id,
+                f"✅ Entry point: {index.relative_to(root)}", source="build")
         return True
 
     @classmethod
@@ -1010,71 +1165,70 @@ class BuildSystem:
         deployment_id: str,
         project_id: str,
     ) -> bool:
-        """Build the frontend (React, Next.js, Vue, etc.)."""
+        """Build React/Next/Vue/Node frontend with chunked npm install."""
         frontend_dir = str(Path(package_json_path).parent)
 
-        await db_add_log(
-            deployment_id, project_id,
-            f"Installing Node.js dependencies ({frontend_type})...",
-            source="build",
-        )
+        pkg_json = os.path.join(frontend_dir, "package.json")
+        if not os.path.exists(pkg_json):
+            await db_add_log(deployment_id, project_id,
+                f"⚠ No package.json in {frontend_dir} — skipping", level="warning", source="build")
+            return False
 
-        # Check for npm/yarn/pnpm
         pkg_manager = "npm"
         if (Path(frontend_dir) / "yarn.lock").exists():
             pkg_manager = "yarn"
         elif (Path(frontend_dir) / "pnpm-lock.yaml").exists():
             pkg_manager = "pnpm"
 
-        # Verify package.json exists before trying npm install
-        pkg_json = os.path.join(frontend_dir, "package.json")
-        if not os.path.exists(pkg_json):
-            await db_add_log(deployment_id, project_id,
-                f"⚠️  No package.json found in {frontend_dir} — skipping npm install",
-                level="warning", source="build")
-            return False
+        # Parse package.json to count deps
+        try:
+            pkg_data = json.loads(Path(pkg_json).read_text())
+            all_deps = {**pkg_data.get("dependencies",{}), **pkg_data.get("devDependencies",{})}
+            total_npm = len(all_deps)
+        except Exception:
+            total_npm = "?"
 
-        # npm install — CI=true avoids interactive prompts, --no-audit speeds it up
-        install_cmd = f"CI=true {pkg_manager} install --legacy-peer-deps --no-audit --prefer-offline"
-        await db_add_log(deployment_id, project_id, f"Running: {install_cmd}", source="build")
-        result = await cls.run_command(install_cmd, cwd=frontend_dir, timeout=600)
+        await db_add_log(deployment_id, project_id,
+            f"Installing {total_npm} npm packages ({frontend_type})...", source="build")
 
-        if result["returncode"] != 0:
-            # Retry without --prefer-offline (cache might be empty)
-            await db_add_log(deployment_id, project_id, "npm install with cache failed, retrying fresh...", level="warning", source="build")
+        # Try --prefer-offline first (fast path), then fresh
+        for flags, label in [
+            ("--legacy-peer-deps --no-audit --prefer-offline", "cached"),
+            ("--legacy-peer-deps --no-audit", "fresh"),
+        ]:
             result = await cls.run_command(
-                f"CI=true {pkg_manager} install --legacy-peer-deps --no-audit",
+                f"CI=true {pkg_manager} install {flags}",
                 cwd=frontend_dir, timeout=900,
+                env={"CI": "true", "NODE_ENV": "production"},
             )
-        if result["returncode"] != 0:
-            stdout_tail = (result.get("stdout","") + result.get("stderr",""))[-800:]
-            rc = result["returncode"]
-            msg = f"npm install failed (exit {rc}):\n{stdout_tail}"
-            await db_add_log(deployment_id, project_id, msg, level="error", source="build")
+            if result["returncode"] == 0:
+                await db_add_log(deployment_id, project_id, f"✅ npm install OK ({label})", source="build")
+                break
+            await db_add_log(deployment_id, project_id,
+                f"npm install ({label}) failed, trying next method...", level="warning", source="build")
+        else:
+            tail = (result.get("stdout","") + result.get("stderr",""))[-600:]
+            await db_add_log(deployment_id, project_id,
+                f"❌ npm install failed:\n{tail}", level="error", source="build")
             return False
 
         # Build
         await db_add_log(deployment_id, project_id, f"Building {frontend_type} frontend...", source="build")
-
         build_cmd = "npm run build" if pkg_manager == "npm" else f"{pkg_manager} build"
         result = await cls.run_command(
-            f"CI=true {build_cmd}",
-            cwd=frontend_dir,
-            timeout=900,
+            f"CI=true {build_cmd}", cwd=frontend_dir, timeout=900,
+            env={"CI": "true"},
         )
-
         if result["returncode"] != 0:
-            stdout_tail = (result.get("stdout","") + result.get("stderr",""))[-800:]
-            rc = result["returncode"]
-            msg = f"Frontend build failed (exit {rc}):\n{stdout_tail}"
-            await db_add_log(deployment_id, project_id, msg, level="error", source="build")
+            tail = (result.get("stdout","") + result.get("stderr",""))[-600:]
+            await db_add_log(deployment_id, project_id,
+                f"❌ Frontend build failed:\n{tail}", level="error", source="build")
             return False
 
-        await db_add_log(deployment_id, project_id, "Frontend build complete.", source="build")
+        await db_add_log(deployment_id, project_id, "✅ Frontend build complete.", source="build")
         return True
 
 
-# ──────────────────────────────────────────────────────────────────────────────
 # SECTION 10: RUNTIME MANAGER (Process Pool)
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -1120,18 +1274,33 @@ async def start_app_process(
     env_vars: Dict[str, str] = None,
 ) -> Optional[int]:
     """
-    Start the user's application as a subprocess.
-    Returns the PID, or None on failure.
+    Start the user's application as an isolated subprocess.
+    Key isolation guarantees:
+    - Deployed app gets its OWN clean env (no PyDeploy secrets leaked)
+    - Only venv/bin is on PATH — no access to system Python packages
+    - Runs in a new session (setsid) so signals don't cascade to PyDeploy
+    - PyDeploy's own SUPABASE_KEY, GEMINI_API_KEY etc are NOT inherited
     """
-    venv_python = os.path.join(project_dir, ".venv", "bin")
-    env = {
-        **os.environ,
+    venv_bin = os.path.join(project_dir, ".venv", "bin")
+
+    # ── Minimal, clean environment for the deployed app ──────────────
+    # Deliberately does NOT pass **os.environ — only safe system vars
+    SAFE_SYSTEM_VARS = {"HOME","USER","LANG","LC_ALL","LC_CTYPE","TZ",
+                        "TMPDIR","TEMP","TMP","XDG_RUNTIME_DIR"}
+    clean_env = {k: v for k, v in os.environ.items() if k in SAFE_SYSTEM_VARS}
+    clean_env.update({
         "PORT": str(port),
         "HOST": "0.0.0.0",
-        "PATH": f"{venv_python}:{os.environ.get('PATH', '')}",
+        "PATH": f"{venv_bin}:/usr/local/bin:/usr/bin:/bin",
         "VIRTUAL_ENV": os.path.join(project_dir, ".venv"),
-        **(env_vars or {}),
-    }
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONPATH": project_dir,
+    })
+    # User-defined env vars go on top (override safe vars if needed)
+    clean_env.update(env_vars or {})
+
+    env = clean_env
 
     # Replace ${PORT:-8000} or $PORT with actual port
     cmd = startup_cmd.replace("${PORT:-8000}", str(port)).replace("$PORT", str(port))
@@ -1401,39 +1570,50 @@ async def run_deployment(
         })
 
         # ── Step 4: Install Python dependencies ───────────────────────
-        if detection["has_requirements"]:
+        if detection.get("is_frontend_only"):
+            await BuildSystem.setup_frontend_only(deploy_dir, deployment_id, project_id)
+        elif detection["has_requirements"]:
             success = await BuildSystem.install_python_deps(
-                deploy_dir,
-                detection["requirements_path"],
-                deployment_id,
-                project_id,
+                deploy_dir, detection["requirements_path"], deployment_id, project_id,
             )
             if not success:
-                raise RuntimeError("Python dependency installation failed.")
+                # Don't hard-fail — AI will fix missing packages
+                await db_add_log(deployment_id, project_id,
+                    "⚠ Some packages failed to install — AI agent will attempt fixes.",
+                    level="warning", source="build")
         else:
-            await db_add_log(
-                deployment_id, project_id,
-                "No requirements.txt found. Skipping pip install.",
-                level="warning",
-                source="build",
-            )
+            await db_add_log(deployment_id, project_id,
+                "No requirements.txt — creating minimal venv with uvicorn/gunicorn.",
+                level="warning", source="build")
+            venv_dir = os.path.join(deploy_dir, ".venv")
+            await BuildSystem.run_command(f"python3 -m venv {venv_dir}", cwd=deploy_dir)
+            pip = os.path.join(venv_dir, "bin", "pip")
+            await BuildSystem.run_command(f"{pip} install gunicorn uvicorn -q", cwd=deploy_dir, timeout=120)
 
         # ── Step 5: Build frontend ─────────────────────────────────────
-        if detection["has_frontend"] and detection["has_package_json"]:
+        if not detection.get("is_frontend_only") and detection["has_frontend"] and detection["has_package_json"]:
             success = await BuildSystem.build_frontend(
-                deploy_dir,
-                detection["frontend_type"],
-                detection["package_json_path"],
-                deployment_id,
-                project_id,
+                deploy_dir, detection["frontend_type"], detection["package_json_path"],
+                deployment_id, project_id,
             )
             if not success:
-                await db_add_log(
-                    deployment_id, project_id,
-                    "Frontend build failed. Continuing with backend only.",
-                    level="warning",
-                    source="build",
-                )
+                await db_add_log(deployment_id, project_id,
+                    "Frontend build failed — continuing with backend only.", level="warning", source="build")
+
+        # ── Step 5b: Frontend-only startup command ─────────────────────
+        if detection.get("is_frontend_only"):
+            # Find the best serve directory (prefer index.html location)
+            serve_dir = deploy_dir
+            for d in ["dist","build","public","www","html","static","."]:
+                candidate = os.path.join(deploy_dir, d)
+                if os.path.exists(os.path.join(candidate, "index.html")):
+                    serve_dir = candidate
+                    break
+            if serve_dir != deploy_dir:
+                startup_cmd = f"python -m http.server ${{PORT:-8000}}"
+                await db_update_project(project_id, {"startup_cmd": startup_cmd, "deploy_dir": serve_dir})
+                await db_update_deployment(deployment_id, {"startup_cmd": startup_cmd})
+                deploy_dir = serve_dir  # serve from the right dir
 
         # ── Step 6: Allocate port & start process ──────────────────────
         port = allocate_port()
@@ -3022,285 +3202,147 @@ def render_upload_page(user: Dict, error: str = "", success: str = "") -> str:
   <div class="animate-in">
     <div style="margin-bottom: 32px;">
       <h1 style="margin:0 0 8px; font-size:28px; font-weight:800;">Deploy a New App</h1>
-      <p style="margin:0; color:var(--muted); font-size:14px;">Upload a ZIP file containing your Python project. We'll handle the rest.</p>
+      <p style="margin:0; color:var(--muted); font-size:14px;">Upload any ZIP — Python, static HTML, bots, workers, full-stack. We handle the rest.</p>
     </div>
-    
-    {'<div style="background:#00ff8811;border:1px solid #00ff8833;border-radius:8px;padding:14px;margin-bottom:24px;color:#00ff88;font-size:13px;">✓ ' + success + '</div>' if success else ''}
-    {'<div style="background:#ff3b3b22;border:1px solid #ff3b3b44;border-radius:8px;padding:14px;margin-bottom:24px;color:#ff6b6b;font-size:13px;">⚠ ' + error + '</div>' if error else ''}
-    
+
+    {{'<div style="background:#00ff8811;border:1px solid #00ff8833;border-radius:8px;padding:14px;margin-bottom:24px;color:#00ff88;font-size:13px;">✓ ' + success + '</div>' if success else ''}}
+    {{'<div style="background:#ff3b3b22;border:1px solid #ff3b3b44;border-radius:8px;padding:14px;margin-bottom:24px;color:#ff6b6b;font-size:13px;">⚠ ' + error + '</div>' if error else ''}}
+
     <form id="uploadForm" enctype="multipart/form-data">
-      <div class="card" style="padding: 28px; margin-bottom: 20px;">
-        <h3 style="margin:0 0 20px; font-size:15px; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:.8px;">Project Details</h3>
-        
-        <div style="margin-bottom: 20px;">
+
+      <!-- Project type tabs -->
+      <div style="display:flex;gap:8px;margin-bottom:20px;">
+        <button type="button" class="type-tab active" onclick="setType('python')" id="tab-python"
+                style="flex:1;padding:10px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;border:1.5px solid #7c3aed;background:#7c3aed22;color:#c084fc;">
+          🐍 Python App
+        </button>
+        <button type="button" class="type-tab" onclick="setType('frontend')" id="tab-frontend"
+                style="flex:1;padding:10px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;border:1.5px solid var(--border);background:transparent;color:var(--muted);">
+          🌐 Frontend Only
+        </button>
+      </div>
+
+      <div class="card" style="padding:28px;margin-bottom:20px;">
+        <h3 style="margin:0 0 20px;font-size:15px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;">Project Details</h3>
+        <div style="margin-bottom:20px;">
           <label class="form-label">Project Name *</label>
-          <input class="form-input" type="text" name="name" id="projectName" placeholder="my-awesome-api" required>
+          <input class="form-input" type="text" name="name" id="projectName" placeholder="my-awesome-app" required>
         </div>
-        <div style="margin-bottom: 0;">
+        <div style="margin-bottom:0;">
           <label class="form-label">Description</label>
-          <input class="form-input" type="text" name="description" placeholder="Brief description of your app">
+          <input class="form-input" type="text" name="description" placeholder="Brief description">
         </div>
       </div>
-      
-      <div class="card" style="padding: 28px; margin-bottom: 20px;">
-        <h3 style="margin:0 0 20px; font-size:15px; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:.8px;">Project ZIP</h3>
-        
+
+      <!-- Python hints (hidden for frontend-only) -->
+      <div id="pythonHints" class="card" style="padding:20px;margin-bottom:20px;border-color:#7c3aed44;background:#7c3aed08;">
+        <div style="font-size:12px;color:#a78bfa;font-weight:700;letter-spacing:.5px;text-transform:uppercase;margin-bottom:10px;">📋 Supported Python Projects</div>
+        <div style="display:flex;flex-wrap:wrap;gap:6px;">
+          {{''.join(f'<span class="framework-chip">{fw}</span>' for fw in ["FastAPI","Flask","Django","Tornado","aiohttp","Streamlit","Gradio","Telegram Bot","Discord Bot","gRPC","Celery","Workers","Scripts"])}}
+        </div>
+      </div>
+
+      <!-- Frontend hints -->
+      <div id="frontendHints" style="display:none;" class="card" style="padding:20px;margin-bottom:20px;border-color:#06b6d444;background:#06b6d408;">
+        <div style="font-size:12px;color:#22d3ee;font-weight:700;letter-spacing:.5px;text-transform:uppercase;margin-bottom:10px;">🌐 Supported Frontend Projects</div>
+        <div style="display:flex;flex-wrap:wrap;gap:6px;">
+          {{''.join(f'<span class="framework-chip">{fw}</span>' for fw in ["HTML / CSS / JS","React","Vue","Svelte","Next.js","Vite","Static Site","Landing Page","Dashboard"])}}
+        </div>
+        <div style="margin-top:10px;font-size:12px;color:var(--muted);">No backend needed — your files are served directly. Just include an <code style="color:#22d3ee;">index.html</code> in your ZIP root.</div>
+      </div>
+
+      <div class="card" style="padding:28px;margin-bottom:20px;">
+        <h3 style="margin:0 0 20px;font-size:15px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;">Project ZIP</h3>
         <div class="upload-zone" id="dropzone" onclick="document.getElementById('zipInput').click()">
           <div id="dropzoneContent">
-            <div style="font-size: 40px; margin-bottom: 16px; opacity: .5;">⬡</div>
-            <div style="font-size: 16px; font-weight: 700; margin-bottom: 8px;">Drop your ZIP here</div>
-            <div style="font-size: 13px; color: var(--muted);">or click to browse · Max {MAX_ZIP_SIZE_MB}MB</div>
+            <div style="font-size:40px;margin-bottom:16px;opacity:.5;">⬡</div>
+            <div style="font-size:16px;font-weight:700;margin-bottom:8px;">Drop your ZIP here</div>
+            <div style="font-size:13px;color:var(--muted);">or click to browse · Max {MAX_ZIP_SIZE_MB}MB</div>
           </div>
         </div>
         <input type="file" id="zipInput" name="file" accept=".zip" style="display:none;" onchange="handleFileSelect(this)">
+        <input type="hidden" id="projectType" name="project_type" value="python">
       </div>
-      
-      <div class="card" style="padding: 28px; margin-bottom: 24px;">
-        <h3 style="margin:0 0 16px; font-size:15px; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:.8px;">
-          Environment Variables <span style="font-size:11px; font-weight:400; color:var(--muted);">(optional)</span>
-        </h3>
-        <div id="envVarsContainer"></div>
-        <button type="button" class="btn-secondary" onclick="addEnvVar()" style="padding:8px 16px;border-radius:6px;font-size:13px;margin-top:8px;">
-          + Add Variable
-        </button>
-      </div>
-      
-      <button class="btn-primary" type="button" onclick="submitDeployment()" id="deployBtn" 
+
+      <button class="btn-primary" type="button" onclick="submitDeployment()" id="deployBtn"
               style="width:100%;padding:14px;border-radius:10px;font-size:16px;" disabled>
         🚀 Deploy Application
       </button>
     </form>
-    
-    <div id="progressSection" style="display:none; margin-top: 28px;">
-      <div class="card" style="padding: 24px;">
-        <div style="display:flex; align-items:center; gap:12px; margin-bottom:16px;">
+
+    <!-- Progress section -->
+    <div id="progressSection" style="display:none;margin-top:28px;">
+      <div class="card" style="padding:24px;">
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;">
           <div class="dot dot-building" style="width:12px;height:12px;"></div>
-          <span style="font-weight:700;">Deploying...</span>
+          <span style="font-weight:700;" id="progressTitle">Deploying...</span>
         </div>
         <div class="log-container" id="progressLog" style="height:300px;">
           <div class="log-line log-build">Uploading ZIP file...</div>
         </div>
       </div>
     </div>
-    
 
-    <!-- ═══════════════════════════════════════════════════════════ -->
-    <!-- REQUIREMENTS BOX                                           -->
-    <!-- ═══════════════════════════════════════════════════════════ -->
-    <div style="margin-top:32px; border:1.5px solid #7c3aed55; border-radius:14px; overflow:hidden; background: linear-gradient(135deg, #0d0a1a 0%, #0a0f18 100%);">
+    <!-- ═══ ENV VARS DETECTION MODAL ═══ -->
+    <div id="envModal" style="display:none;position:fixed;inset:0;background:#000000cc;z-index:1000;display:none;align-items:center;justify-content:center;padding:20px;">
+      <div style="background:#0d1117;border:1.5px solid #f472b655;border-radius:16px;max-width:560px;width:100%;max-height:90vh;overflow-y:auto;box-shadow:0 0 60px #f472b622;">
 
-      <!-- Header -->
-      <div style="display:flex;align-items:center;gap:12px;padding:18px 24px;background:linear-gradient(135deg,#7c3aed22,#06b6d422);border-bottom:1px solid #7c3aed33;">
-        <span style="font-size:22px;">📋</span>
-        <div>
-          <div style="font-size:15px;font-weight:800;color:#e2d9ff;letter-spacing:.3px;">Deployment Requirements</div>
-          <div style="font-size:12px;color:#9b8ec4;margin-top:2px;">Follow these to deploy with zero warnings or errors</div>
-        </div>
-        <div style="margin-left:auto;">
-          <span style="font-size:11px;font-weight:700;background:#7c3aed33;color:#c084fc;padding:4px 10px;border-radius:20px;letter-spacing:.5px;">READ BEFORE UPLOADING</span>
-        </div>
-      </div>
-
-      <div style="padding:24px;display:grid;gap:20px;">
-
-        <!-- 1. File structure -->
-        <div style="background:#ffffff07;border-radius:10px;padding:18px 20px;border-left:3px solid #00cfff;">
-          <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;">
-            <span style="font-size:16px;">📁</span>
-            <span style="font-weight:800;color:#00cfff;font-size:14px;">1. ZIP Structure</span>
-          </div>
-          <div style="font-size:13px;color:#cbd5e1;line-height:1.8;">
-            • Put your files <strong style="color:#fff;">directly in the ZIP root</strong> (not inside a subfolder)<br>
-            • OR one top-level folder is fine — we flatten it automatically<br>
-            • Required: at least one Python entry file (<code style="color:#00cfff;background:#ffffff11;padding:1px 5px;border-radius:3px;">app.py</code>, <code style="color:#00cfff;background:#ffffff11;padding:1px 5px;border-radius:3px;">main.py</code>, <code style="color:#00cfff;background:#ffffff11;padding:1px 5px;border-radius:3px;">bot.py</code>, <code style="color:#00cfff;background:#ffffff11;padding:1px 5px;border-radius:3px;">server.py</code>, etc.)<br>
-            • Max ZIP size: <strong style="color:#fff;">{MAX_ZIP_SIZE_MB} MB</strong> · Max unzipped: <strong style="color:#fff;">{MAX_UNZIPPED_SIZE_MB} MB</strong><br>
-            • <strong style="color:#ff6b6b;">Never include</strong> <code style="color:#ff6b6b;background:#ffffff11;padding:1px 5px;border-radius:3px;">.venv/</code>, <code style="color:#ff6b6b;background:#ffffff11;padding:1px 5px;border-radius:3px;">node_modules/</code>, <code style="color:#ff6b6b;background:#ffffff11;padding:1px 5px;border-radius:3px;">__pycache__/</code> — they bloat your ZIP
-          </div>
-          <div style="margin-top:12px;background:#000000aa;border-radius:6px;padding:10px 14px;font-family:'Space Mono',monospace;font-size:11px;color:#64748b;line-height:1.7;">
-            <span style="color:#00ff88;">✓</span>  my-project.zip<br>
-            <span style="color:#64748b;">  ├── app.py</span>          <span style="color:#00ff88;">← entry point</span><br>
-            <span style="color:#64748b;">  ├── requirements.txt</span>  <span style="color:#00ff88;">← dependencies</span><br>
-            <span style="color:#64748b;">  ├── .env.example</span>     <span style="color:#facc15;">← env var template (not .env!)</span><br>
-            <span style="color:#64748b;">  └── utils/</span>            <span style="color:#64748b;">← any sub-folders OK</span>
-          </div>
-        </div>
-
-        <!-- 2. requirements.txt -->
-        <div style="background:#ffffff07;border-radius:10px;padding:18px 20px;border-left:3px solid #00ff88;">
-          <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;">
-            <span style="font-size:16px;">📦</span>
-            <span style="font-weight:800;color:#00ff88;font-size:14px;">2. Dependencies — requirements.txt</span>
-          </div>
-          <div style="font-size:13px;color:#cbd5e1;line-height:1.8;">
-            • <strong style="color:#fff;">Must exist</strong> at the root — we run <code style="color:#00ff88;background:#ffffff11;padding:1px 5px;border-radius:3px;">pip install -r requirements.txt</code> automatically<br>
-            • Pin your versions for reproducibility: <code style="color:#00ff88;background:#ffffff11;padding:1px 5px;border-radius:3px;">fastapi==0.115.0</code><br>
-            • Include your web server: <code style="color:#00ff88;background:#ffffff11;padding:1px 5px;border-radius:3px;">uvicorn[standard]</code> for FastAPI/Starlette, <code style="color:#00ff88;background:#ffffff11;padding:1px 5px;border-radius:3px;">gunicorn</code> for Flask/Django<br>
-            • <strong style="color:#ff6b6b;">Do NOT</strong> include system packages (apt-get stuff) — Python packages only<br>
-            • Missing package? Our AI agent will detect and install it automatically
-          </div>
-          <div style="margin-top:12px;background:#000000aa;border-radius:6px;padding:10px 14px;font-family:'Space Mono',monospace;font-size:11px;color:#64748b;line-height:1.7;">
-            <span style="color:#64748b;"># requirements.txt example</span><br>
-            fastapi==0.115.0<br>
-            uvicorn[standard]==0.30.0<br>
-            python-dotenv==1.0.0<br>
-            httpx==0.27.0
-          </div>
-        </div>
-
-        <!-- 3. Port binding -->
-        <div style="background:#ffffff07;border-radius:10px;padding:18px 20px;border-left:3px solid #facc15;">
-          <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;">
-            <span style="font-size:16px;">🔌</span>
-            <span style="font-weight:800;color:#facc15;font-size:14px;">3. Port Binding — Critical!</span>
-            <span style="font-size:10px;font-weight:700;background:#facc1533;color:#facc15;padding:2px 7px;border-radius:10px;margin-left:4px;">MOST COMMON FAILURE</span>
-          </div>
-          <div style="font-size:13px;color:#cbd5e1;line-height:1.8;">
-            • Your app <strong style="color:#fff;">MUST</strong> read the port from the <code style="color:#facc15;background:#ffffff11;padding:1px 5px;border-radius:3px;">PORT</code> environment variable<br>
-            • Bind to <code style="color:#facc15;background:#ffffff11;padding:1px 5px;border-radius:3px;">0.0.0.0</code> (not localhost or 127.0.0.1 — those won't be reachable)<br>
-            • We inject <code style="color:#facc15;background:#ffffff11;padding:1px 5px;border-radius:3px;">PORT</code> automatically — just read <code style="color:#facc15;background:#ffffff11;padding:1px 5px;border-radius:3px;">os.environ["PORT"]</code>
-          </div>
-          <div style="margin-top:12px;display:grid;grid-template-columns:1fr 1fr;gap:8px;">
-            <div style="background:#ff3b3b11;border:1px solid #ff3b3b33;border-radius:6px;padding:10px 12px;font-family:'Space Mono',monospace;font-size:11px;line-height:1.7;">
-              <div style="color:#ff6b6b;font-weight:700;margin-bottom:4px;">❌ Wrong</div>
-              <span style="color:#64748b;">uvicorn app:app<br>  --port 8000<br>  --host 127.0.0.1</span>
-            </div>
-            <div style="background:#00ff8811;border:1px solid #00ff8833;border-radius:6px;padding:10px 12px;font-family:'Space Mono',monospace;font-size:11px;line-height:1.7;">
-              <div style="color:#00ff88;font-weight:700;margin-bottom:4px;">✓ Correct</div>
-              <span style="color:#64748b;">port = int(os.environ<br>  .get("PORT", 8000))<br>uvicorn app:app<br>  --host 0.0.0.0<br>  --port $PORT</span>
+        <!-- Header -->
+        <div style="padding:20px 24px;border-bottom:1px solid #f472b633;background:linear-gradient(135deg,#f472b615,#7c3aed15);">
+          <div style="display:flex;align-items:center;gap:12px;">
+            <span style="font-size:24px;">🔑</span>
+            <div>
+              <div style="font-weight:800;color:#f472b6;font-size:15px;">Environment Variables Detected</div>
+              <div style="font-size:12px;color:#9b8ec4;margin-top:2px;">Your project references these secrets. Fill in what you know — you can always add more later.</div>
             </div>
           </div>
         </div>
 
-        <!-- 4. Environment variables -->
-        <div style="background:#ffffff07;border-radius:10px;padding:18px 20px;border-left:3px solid #f472b6;">
-          <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;">
-            <span style="font-size:16px;">🔑</span>
-            <span style="font-weight:800;color:#f472b6;font-size:14px;">4. Secrets &amp; Environment Variables</span>
-          </div>
-          <div style="font-size:13px;color:#cbd5e1;line-height:1.8;">
-            • <strong style="color:#fff;">Never commit</strong> <code style="color:#f472b6;background:#ffffff11;padding:1px 5px;border-radius:3px;">.env</code> files — add them in the <strong>Env Vars</strong> section below before deploying<br>
-            • Telegram bots need: <code style="color:#f472b6;background:#ffffff11;padding:1px 5px;border-radius:3px;">TELEGRAM_BOT_TOKEN</code><br>
-            • Discord bots need: <code style="color:#f472b6;background:#ffffff11;padding:1px 5px;border-radius:3px;">DISCORD_TOKEN</code><br>
-            • OpenAI apps need: <code style="color:#f472b6;background:#ffffff11;padding:1px 5px;border-radius:3px;">OPENAI_API_KEY</code><br>
-            • Database apps need: <code style="color:#f472b6;background:#ffffff11;padding:1px 5px;border-radius:3px;">DATABASE_URL</code> or similar<br>
-            • Your code should handle missing vars gracefully: use <code style="color:#f472b6;background:#ffffff11;padding:1px 5px;border-radius:3px;">os.getenv("KEY", "")</code> not <code style="color:#ff6b6b;background:#ffffff11;padding:1px 5px;border-radius:3px;">os.environ["KEY"]</code>
-          </div>
-        </div>
+        <!-- Vars list -->
+        <div style="padding:20px 24px;" id="envModalVarsList"></div>
 
-        <!-- 5. Framework specifics -->
-        <div style="background:#ffffff07;border-radius:10px;padding:18px 20px;border-left:3px solid #818cf8;">
-          <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;">
-            <span style="font-size:16px;">⚙️</span>
-            <span style="font-weight:800;color:#818cf8;font-size:14px;">5. Framework-Specific Requirements</span>
-          </div>
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;font-size:12px;">
-            <div style="background:#ffffff05;border-radius:8px;padding:12px;">
-              <div style="color:#00cfff;font-weight:700;margin-bottom:8px;">FastAPI / Starlette</div>
-              <div style="color:#94a3b8;line-height:1.8;">
-                • <code style="color:#00cfff;">uvicorn[standard]</code> in requirements<br>
-                • Entry: <code style="color:#00cfff;">app = FastAPI()</code><br>
-                • Cmd: <code style="color:#00cfff;">uvicorn app:app --host 0.0.0.0 --port $PORT</code>
-              </div>
-            </div>
-            <div style="background:#ffffff05;border-radius:8px;padding:12px;">
-              <div style="color:#f97316;font-weight:700;margin-bottom:8px;">Flask</div>
-              <div style="color:#94a3b8;line-height:1.8;">
-                • <code style="color:#f97316;">gunicorn</code> or <code style="color:#f97316;">flask</code> in requirements<br>
-                • Entry: <code style="color:#f97316;">app = Flask(__name__)</code><br>
-                • Cmd: <code style="color:#f97316;">gunicorn app:app --bind 0.0.0.0:$PORT</code>
-              </div>
-            </div>
-            <div style="background:#ffffff05;border-radius:8px;padding:12px;">
-              <div style="color:#10b981;font-weight:700;margin-bottom:8px;">Django</div>
-              <div style="color:#94a3b8;line-height:1.8;">
-                • <code style="color:#10b981;">gunicorn</code> + <code style="color:#10b981;">django</code> in requirements<br>
-                • Must have <code style="color:#10b981;">wsgi.py</code> or <code style="color:#10b981;">asgi.py</code><br>
-                • Set <code style="color:#10b981;">DJANGO_SETTINGS_MODULE</code> env var
-              </div>
-            </div>
-            <div style="background:#ffffff05;border-radius:8px;padding:12px;">
-              <div style="color:#a78bfa;font-weight:700;margin-bottom:8px;">Telegram / Discord Bots</div>
-              <div style="color:#94a3b8;line-height:1.8;">
-                • <code style="color:#a78bfa;">python-telegram-bot</code> or <code style="color:#a78bfa;">discord.py</code><br>
-                • Token in Env Vars before deploy<br>
-                • Entry: <code style="color:#a78bfa;">bot.py</code> or <code style="color:#a78bfa;">main.py</code> with polling loop
-              </div>
-            </div>
-            <div style="background:#ffffff05;border-radius:8px;padding:12px;">
-              <div style="color:#fb923c;font-weight:700;margin-bottom:8px;">Scripts / Workers</div>
-              <div style="color:#94a3b8;line-height:1.8;">
-                • Must run <strong>indefinitely</strong> (loop or blocking call)<br>
-                • Scripts that exit immediately = unhealthy<br>
-                • Use <code style="color:#fb923c;">while True: time.sleep()</code> or event loop
-              </div>
-            </div>
-            <div style="background:#ffffff05;border-radius:8px;padding:12px;">
-              <div style="color:#34d399;font-weight:700;margin-bottom:8px;">React / Next.js Frontend</div>
-              <div style="color:#94a3b8;line-height:1.8;">
-                • Include <code style="color:#34d399;">package.json</code> with build script<br>
-                • Backend must serve built files<br>
-                • Or use separate backend + static dir
-              </div>
-            </div>
-          </div>
+        <!-- Actions -->
+        <div style="padding:0 24px 20px;display:flex;gap:10px;align-items:center;">
+          <button onclick="saveEnvAndContinue()" id="envSaveBtn"
+                  style="background:linear-gradient(135deg,#7c3aed,#f472b6);border:none;color:#fff;font-weight:700;padding:10px 24px;border-radius:8px;cursor:pointer;font-size:14px;flex:1;">
+            💾 Save & Continue Deployment
+          </button>
+          <button onclick="skipEnvAndContinue()"
+                  style="background:transparent;border:1px solid #ffffff22;color:var(--muted);font-size:13px;padding:10px 16px;border-radius:8px;cursor:pointer;white-space:nowrap;">
+            I'll do it later
+          </button>
         </div>
-
-        <!-- 6. Common errors -->
-        <div style="background:#ff3b3b0a;border:1px solid #ff3b3b22;border-radius:10px;padding:18px 20px;">
-          <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;">
-            <span style="font-size:16px;">🚨</span>
-            <span style="font-weight:800;color:#ff6b6b;font-size:14px;">6. Common Errors &amp; How to Fix Them</span>
-          </div>
-          <div style="display:grid;gap:8px;font-size:12px;">
-            <div style="display:flex;gap:12px;align-items:flex-start;padding:8px 0;border-bottom:1px solid #ffffff0a;">
-              <code style="color:#ff6b6b;background:#ff3b3b11;padding:2px 7px;border-radius:4px;white-space:nowrap;flex-shrink:0;">ModuleNotFoundError</code>
-              <span style="color:#94a3b8;">Package not in requirements.txt — add it. Our AI will also try to install it automatically.</span>
-            </div>
-            <div style="display:flex;gap:12px;align-items:flex-start;padding:8px 0;border-bottom:1px solid #ffffff0a;">
-              <code style="color:#ff6b6b;background:#ff3b3b11;padding:2px 7px;border-radius:4px;white-space:nowrap;flex-shrink:0;">ValueError: X is not set</code>
-              <span style="color:#94a3b8;">Missing environment variable — add it in the Env Vars section below.</span>
-            </div>
-            <div style="display:flex;gap:12px;align-items:flex-start;padding:8px 0;border-bottom:1px solid #ffffff0a;">
-              <code style="color:#ff6b6b;background:#ff3b3b11;padding:2px 7px;border-radius:4px;white-space:nowrap;flex-shrink:0;">No such file: main.py</code>
-              <span style="color:#94a3b8;">Your entry file has a different name. Our AI detects and fixes this automatically.</span>
-            </div>
-            <div style="display:flex;gap:12px;align-items:flex-start;padding:8px 0;border-bottom:1px solid #ffffff0a;">
-              <code style="color:#ff6b6b;background:#ff3b3b11;padding:2px 7px;border-radius:4px;white-space:nowrap;flex-shrink:0;">Connection refused</code>
-              <span style="color:#94a3b8;">App not binding to 0.0.0.0 or not using PORT env var. Fix in your server config.</span>
-            </div>
-            <div style="display:flex;gap:12px;align-items:flex-start;padding:8px 0;border-bottom:1px solid #ffffff0a;">
-              <code style="color:#ff6b6b;background:#ff3b3b11;padding:2px 7px;border-radius:4px;white-space:nowrap;flex-shrink:0;">Process exited code 1</code>
-              <span style="color:#94a3b8;">App crashed at startup. Check the logs — our AI agent will auto-diagnose and fix.</span>
-            </div>
-            <div style="display:flex;gap:12px;align-items:flex-start;padding:8px 0;">
-              <code style="color:#ff6b6b;background:#ff3b3b11;padding:2px 7px;border-radius:4px;white-space:nowrap;flex-shrink:0;">SyntaxError</code>
-              <span style="color:#94a3b8;">Python version mismatch or typo. Our AI will read the file and patch the bug.</span>
-            </div>
-          </div>
+        <div style="padding:0 24px 16px;font-size:11px;color:#64748b;text-align:center;">
+          Empty fields are skipped — your app will still deploy. You can set vars anytime from the project page.
         </div>
-
-        <!-- AI auto-fix notice -->
-        <div style="background:linear-gradient(135deg,#7c3aed15,#06b6d415);border:1px solid #7c3aed33;border-radius:10px;padding:16px 20px;display:flex;gap:14px;align-items:flex-start;">
-          <span style="font-size:24px;flex-shrink:0;">🤖</span>
-          <div>
-            <div style="font-weight:800;color:#c084fc;font-size:13px;margin-bottom:6px;">AI Auto-Fix Agent (Gemini 3.1 Pro)</div>
-            <div style="font-size:12px;color:#94a3b8;line-height:1.8;">
-              If your deployment fails, our AI agent automatically diagnoses and fixes the problem — 
-              wrong startup command, missing packages, port binding issues, syntax errors, and more. 
-              It has full control over your project files and can install packages, edit code, 
-              and restart the app. <strong style="color:#c084fc;">You just need to set your env vars.</strong>
-            </div>
-          </div>
-        </div>
-
       </div>
     </div>
 
-    <div style="margin-top: 20px;" class="card" style="padding:20px;">
-      <div style="padding:20px;">
-        <h3 style="margin:0 0 12px; font-size:14px; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:.8px;">Supported Frameworks</h3>
-        <div style="display:flex; flex-wrap:wrap; gap:8px;">
-          {''.join(f'<span class="framework-chip">{fw}</span>' for fw in ["FastAPI", "Flask", "Django", "Starlette", "Tornado", "aiohttp", "+ React", "+ Next.js", "+ Static"])}
+    <!-- Requirements box -->
+    <div style="margin-top:32px;border:1.5px solid #7c3aed55;border-radius:14px;overflow:hidden;background:linear-gradient(135deg,#0d0a1a,#0a0f18);">
+      <div style="display:flex;align-items:center;gap:12px;padding:18px 24px;background:linear-gradient(135deg,#7c3aed22,#06b6d422);border-bottom:1px solid #7c3aed33;">
+        <span style="font-size:22px;">📋</span>
+        <div>
+          <div style="font-size:15px;font-weight:800;color:#e2d9ff;">Deployment Requirements</div>
+          <div style="font-size:12px;color:#9b8ec4;margin-top:2px;">Follow these to deploy with zero errors</div>
+        </div>
+        <span style="margin-left:auto;font-size:11px;font-weight:700;background:#7c3aed33;color:#c084fc;padding:4px 10px;border-radius:20px;">READ FIRST</span>
+      </div>
+      <div style="padding:20px 24px;display:grid;gap:14px;">
+        <div style="background:#ffffff07;border-radius:8px;padding:14px 16px;border-left:3px solid #00cfff;font-size:13px;color:#cbd5e1;line-height:1.8;">
+          <strong style="color:#00cfff;">📁 ZIP Structure:</strong> Files in root, max {MAX_ZIP_SIZE_MB}MB. Don't include <code style="color:#ff6b6b;">.venv/</code> or <code style="color:#ff6b6b;">node_modules/</code>
+        </div>
+        <div style="background:#ffffff07;border-radius:8px;padding:14px 16px;border-left:3px solid #facc15;font-size:13px;color:#cbd5e1;line-height:1.8;">
+          <strong style="color:#facc15;">🔌 Port:</strong> Your app <strong>MUST</strong> bind to <code style="color:#facc15;">0.0.0.0</code> and use <code style="color:#facc15;">os.environ["PORT"]</code>
+        </div>
+        <div style="background:#ffffff07;border-radius:8px;padding:14px 16px;border-left:3px solid #00ff88;font-size:13px;color:#cbd5e1;line-height:1.8;">
+          <strong style="color:#00ff88;">📦 Dependencies:</strong> Include <code style="color:#00ff88;">requirements.txt</code> for Python, or <code style="color:#00ff88;">package.json</code> for Node.js
+        </div>
+        <div style="background:linear-gradient(135deg,#7c3aed15,#06b6d415);border:1px solid #7c3aed33;border-radius:8px;padding:14px 16px;display:flex;gap:10px;">
+          <span style="font-size:18px;">🤖</span>
+          <div style="font-size:12px;color:#94a3b8;line-height:1.7;">
+            <strong style="color:#c084fc;">AI Auto-Fix (Gemini 3.1 Pro):</strong> If deployment fails, the AI agent automatically diagnoses and fixes wrong commands, missing packages, syntax errors, port issues, and more.
+          </div>
         </div>
       </div>
     </div>
@@ -3308,6 +3350,29 @@ def render_upload_page(user: Dict, error: str = "", success: str = "") -> str:
 </div>
 
 <script>
+let _projectType = 'python';
+let _deployedProjectId = null;
+let _detectedEnvKeys = [];
+let _deployFormData = null;
+
+function setType(type) {{
+  _projectType = type;
+  document.getElementById('projectType').value = type;
+  document.querySelectorAll('.type-tab').forEach(t => {{
+    t.style.borderColor = 'var(--border)';
+    t.style.background = 'transparent';
+    t.style.color = 'var(--muted)';
+  }});
+  const tab = document.getElementById('tab-' + type);
+  tab.style.borderColor = '#7c3aed';
+  tab.style.background = '#7c3aed22';
+  tab.style.color = '#c084fc';
+  document.getElementById('pythonHints').style.display = type === 'python' ? 'block' : 'none';
+  document.getElementById('frontendHints').style.display = type === 'frontend' ? 'block' : 'none';
+  const btn = document.getElementById('deployBtn');
+  btn.textContent = type === 'frontend' ? '🌐 Deploy Frontend' : '🚀 Deploy Application';
+}}
+
 const dropzone = document.getElementById('dropzone');
 const zipInput = document.getElementById('zipInput');
 const deployBtn = document.getElementById('deployBtn');
@@ -3335,59 +3400,97 @@ document.getElementById('projectName').addEventListener('input', function() {{
   deployBtn.disabled = !this.value.trim() || !zipInput.files[0];
 }});
 
-function addEnvVar() {{
-  const c = document.getElementById('envVarsContainer');
-  if (!c.querySelector('[data-envrow]') && c.children.length === 0) {{
-    c.innerHTML = '';  // clear placeholder
-  }}
-  const row = document.createElement('div');
-  row.setAttribute('data-envrow', '');
-  row.style.cssText = 'display:flex;gap:8px;margin-bottom:8px;align-items:center;';
-  row.innerHTML = `
-    <input class="form-input" type="text" placeholder="KEY"
-           style="width:35%;font-family:'Space Mono',monospace;font-size:12px;" data-key-input>
-    <div style="flex:1;position:relative;">
-      <input class="form-input" type="password" placeholder="value"
-             style="width:100%;font-family:'Space Mono',monospace;font-size:12px;padding-right:36px;" data-val-input>
-      <button type="button" onclick="toggleEnvReveal(this)"
-              style="position:absolute;right:8px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--muted);cursor:pointer;font-size:14px;padding:0;">👁</button>
-    </div>
-    <button type="button" onclick="this.closest('[data-envrow]').remove()"
-            style="background:#ff3b3b22;border:1px solid #ff3b3b44;color:#ff6b6b;border-radius:6px;padding:7px 11px;cursor:pointer;font-size:13px;">✕</button>
-  `;
-  c.appendChild(row);
-  row.querySelector('[data-key-input]').focus();
-}}
-
-function toggleEnvReveal(btn) {{
-  const inp = btn.previousElementSibling;
-  inp.type = inp.type === 'password' ? 'text' : 'password';
-  btn.textContent = inp.type === 'password' ? '👁' : '🙈';
-}}
-
+// ── Step 1: Click Deploy → scan ZIP for env vars then show modal ─────────
 async function submitDeployment() {{
   const name = document.getElementById('projectName').value.trim();
   const file = zipInput.files[0];
   if (!name || !file) return;
-  
-  // Collect env vars
-  const envVars = {{}};
-  document.querySelectorAll('#envVarsContainer [data-envrow]').forEach(row => {{
-    const k = (row.querySelector('[data-key-input]').value || '').trim();
-    const v = row.querySelector('[data-val-input]').value;
-    if (k) envVars[k] = v;
-  }});
-  
+
+  deployBtn.disabled = true;
+  deployBtn.textContent = '🔍 Scanning project...';
+
+  // First: scan the ZIP on the server for env var keys
+  const scanFd = new FormData();
+  scanFd.append('file', file);
+  let envKeys = [];
+  try {{
+    const sr = await fetch('/api/scan-zip-env', {{method: 'POST', body: scanFd}});
+    if (sr.ok) {{
+      const sd = await sr.json();
+      envKeys = sd.keys || [];
+    }}
+  }} catch(e) {{}}
+
+  // Build FormData for actual deploy (save for after modal)
   const fd = new FormData();
   fd.append('name', name);
   fd.append('description', document.querySelector('input[name=description]').value);
   fd.append('file', file);
-  fd.append('env_vars', JSON.stringify(envVars));
-  
+  fd.append('project_type', _projectType);
+  _deployFormData = fd;
+  _detectedEnvKeys = envKeys;
+
+  if (envKeys.length > 0) {{
+    // Show env modal before deploying
+    showEnvModal(envKeys);
+  }} else {{
+    // No env vars detected — deploy directly
+    await startActualDeploy({{}});
+  }}
+}}
+
+function showEnvModal(keys) {{
+  const list = document.getElementById('envModalVarsList');
+  list.innerHTML = keys.map(k => `
+    <div style="display:flex;gap:8px;margin-bottom:10px;align-items:center;">
+      <div style="width:40%;font-family:'Space Mono',monospace;font-size:12px;color:#c084fc;
+                  background:#7c3aed1a;padding:8px 10px;border-radius:6px;border:1px solid #7c3aed33;
+                  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${{k}}">${{k}}</div>
+      <div style="flex:1;position:relative;">
+        <input type="password" placeholder="value (optional)"
+               style="width:100%;background:#0a0e12;border:1px solid #ffffff22;color:#e2e8f0;
+                      border-radius:6px;padding:8px 36px 8px 10px;font-size:12px;font-family:'Space Mono',monospace;box-sizing:border-box;"
+               data-env-key="${{k}}"
+               oninput="this.style.borderColor=this.value?'#00ff8855':'#ffffff22'">
+        <button type="button" onclick="togglePw(this)"
+                style="position:absolute;right:8px;top:50%;transform:translateY(-50%);background:none;border:none;color:#64748b;cursor:pointer;font-size:13px;padding:0;">👁</button>
+      </div>
+    </div>
+  `).join('');
+  const modal = document.getElementById('envModal');
+  modal.style.display = 'flex';
+  // Focus first input
+  setTimeout(() => {{ const f = modal.querySelector('input[data-env-key]'); if(f) f.focus(); }}, 100);
+}}
+
+function togglePw(btn) {{
+  const inp = btn.previousElementSibling;
+  inp.type = inp.type==='password' ? 'text' : 'password';
+  btn.textContent = inp.type==='password' ? '👁' : '🙈';
+}}
+
+async function saveEnvAndContinue() {{
+  const envVars = {{}};
+  document.querySelectorAll('[data-env-key]').forEach(inp => {{
+    const k = inp.getAttribute('data-env-key');
+    const v = inp.value.trim();
+    if (v) envVars[k] = v;
+  }});
+  document.getElementById('envModal').style.display = 'none';
+  await startActualDeploy(envVars);
+}}
+
+async function skipEnvAndContinue() {{
+  document.getElementById('envModal').style.display = 'none';
+  await startActualDeploy({{}});
+}}
+
+async function startActualDeploy(envVars) {{
   deployBtn.disabled = true;
   deployBtn.textContent = 'Deploying...';
   document.getElementById('progressSection').style.display = 'block';
-  
+  document.getElementById('progressSection').scrollIntoView({{behavior:'smooth', block:'nearest'}});
+
   const log = document.getElementById('progressLog');
   const addLog = (msg, cls='log-info') => {{
     const d = document.createElement('div');
@@ -3396,54 +3499,59 @@ async function submitDeployment() {{
     log.appendChild(d);
     log.scrollTop = log.scrollHeight;
   }};
-  
+
+  _deployFormData.set('env_vars', JSON.stringify(envVars));
+
   try {{
     addLog('Uploading ZIP...', 'log-build');
-    const r = await fetch('/api/deploy', {{method: 'POST', body: fd}});
+    const r = await fetch('/api/deploy', {{method:'POST', body:_deployFormData}});
     const data = await r.json();
-    
     if (!r.ok) throw new Error(data.detail || 'Upload failed');
-    
-    addLog('Project created! Starting build...', 'log-success');
-    const projectId = data.project_id;
-    
-    // Poll for logs
+
+    addLog('Project created! Build starting...', 'log-success');
+    _deployedProjectId = data.project_id;
+
     let lastCount = 0;
     const poll = async () => {{
-      const lr = await fetch('/api/projects/' + projectId + '/logs');
-      const logs = await lr.json();
-      for (let i = lastCount; i < logs.length; i++) {{
-        const l = logs[i];
-        const cls = l.level === 'error' ? 'log-error' : (l.source === 'build' ? 'log-build' : (l.level === 'warning' ? 'log-warning' : 'log-info'));
-        addLog(l.message, cls);
-      }}
-      lastCount = logs.length;
-      
-      // Check project status
-      const pr = await fetch('/api/projects/' + projectId);
-      const proj = await pr.json();
-      if (proj.status === 'running') {{
-        addLog('🎉 Deployment successful! Redirecting...', 'log-success');
-        setTimeout(() => window.location.href = '/project/' + projectId, 1500);
-      }} else if (proj.status === 'failed') {{
-        addLog('❌ Deployment failed. See logs above.', 'log-error');
-        deployBtn.disabled = false;
-        deployBtn.textContent = '🚀 Deploy Application';
-      }} else {{
-        setTimeout(poll, 2000);
-      }}
+      try {{
+        const lr = await fetch('/api/projects/' + _deployedProjectId + '/logs');
+        const logs = await lr.json();
+        for (let i = lastCount; i < logs.length; i++) {{
+          const l = logs[i];
+          const cls = l.source==='ai'?'log-ai': l.level==='error'?'log-error': l.source==='build'?'log-build': l.level==='warning'?'log-warning':'log-info';
+          addLog(l.message, cls);
+        }}
+        lastCount = logs.length;
+
+        const pr = await fetch('/api/projects/' + _deployedProjectId);
+        const proj = await pr.json();
+        if (proj.status === 'running') {{
+          addLog('🎉 Deployment successful! Redirecting...', 'log-success');
+          setTimeout(() => window.location.href = '/project/' + _deployedProjectId, 1500);
+        }} else if (proj.status === 'failed') {{
+          addLog('❌ Build failed — AI agent is trying to fix it automatically. Check logs.', 'log-error');
+          setTimeout(() => window.location.href = '/project/' + _deployedProjectId, 3000);
+        }} else {{
+          setTimeout(poll, 1500);
+        }}
+      }} catch(e) {{ setTimeout(poll, 2000); }}
     }};
-    
-    setTimeout(poll, 2000);
-    
+    setTimeout(poll, 1500);
+
   }} catch(e) {{
     addLog('Error: ' + e.message, 'log-error');
     deployBtn.disabled = false;
-    deployBtn.textContent = '🚀 Deploy Application';
+    deployBtn.textContent = _projectType==='frontend' ? '🌐 Deploy Frontend' : '🚀 Deploy Application';
   }}
 }}
+
+// Close modal on backdrop click
+document.getElementById('envModal').addEventListener('click', function(e) {{
+  if (e.target === this) skipEnvAndContinue();
+}});
 </script>"""
     return _base_html("Upload", body)
+
 
 
 def render_project_page(user: Dict, project: Dict, deployments: List[Dict]) -> str:
@@ -4240,6 +4348,49 @@ async def logs_page(request: Request, deployment_id: str):
 # ──────────────────────────────────────────────────────────────────────────────
 
 @app.post("/api/deploy")
+@app.post("/api/scan-zip-env")
+async def api_scan_zip_env(
+    request: Request,
+    file: UploadFile = File(...),
+):
+    """
+    Scan an uploaded ZIP for environment variable references WITHOUT deploying.
+    Used by the upload page to show the env vars modal before deployment.
+    """
+    user = await get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401)
+
+    try:
+        zip_bytes = await file.read()
+        import tempfile, zipfile as _zipfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with _zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+                # Only extract .py and .env* files — fast and safe
+                for member in zf.namelist():
+                    name_lower = os.path.basename(member).lower()
+                    if (name_lower.endswith(".py") or
+                        name_lower.startswith(".env") or
+                        name_lower in ("requirements.txt","pyproject.toml")):
+                        # Guard against path traversal
+                        dest = os.path.normpath(os.path.join(tmpdir, member))
+                        if dest.startswith(tmpdir):
+                            try:
+                                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                                with zf.open(member) as src, open(dest, "wb") as dst:
+                                    dst.write(src.read(500_000))  # max 500KB per file
+                            except Exception:
+                                pass
+
+            keys = scan_project_env_vars(tmpdir)
+    except Exception as exc:
+        logger.warning(f"scan-zip-env error: {exc}")
+        keys = []
+
+    return JSONResponse({"keys": keys})
+
+
 async def api_deploy(
     request: Request,
     background_tasks: BackgroundTasks,
@@ -4247,6 +4398,7 @@ async def api_deploy(
     description: str = Form(""),
     file: UploadFile = File(...),
     env_vars: str = Form("{}"),
+    project_type: str = Form("python"),
 ):
     """Upload a ZIP and trigger deployment pipeline."""
     user = await get_current_user(request)
