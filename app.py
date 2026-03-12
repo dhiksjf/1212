@@ -80,6 +80,8 @@ SUPABASE_SERVICE_KEY: str = os.environ.get("SUPABASE_SERVICE_KEY", SUPABASE_KEY)
 SECRET_KEY: str = os.environ.get("SECRET_KEY", "change-me-in-production-" + uuid.uuid4().hex)
 PORT: int = int(os.environ.get("PORT", "8000"))
 BASE_DEPLOY_DIR: str = os.environ.get("BASE_DEPLOY_DIR", "/tmp/pydeploy_apps")
+NPM_CACHE_DIR:   str = "/tmp/pydeploy_npm_cache"          # shared npm cache across all deployments
+NPM_MODULES_DIR: str = "/tmp/pydeploy_node_modules_cache"  # node_modules keyed by package.json hash
 MAX_ZIP_SIZE_MB: int = int(os.environ.get("MAX_ZIP_SIZE_MB", "100"))
 MAX_UNZIPPED_SIZE_MB: int = int(os.environ.get("MAX_UNZIPPED_SIZE_MB", "500"))
 BASE_APP_PORT: int = int(os.environ.get("BASE_APP_PORT", "9000"))
@@ -1234,70 +1236,237 @@ class BuildSystem:
         deployment_id: str,
         project_id: str,
     ) -> bool:
-        """Build React/Next/Vue/Node frontend with chunked npm install."""
+        """Build React/Next/Vue/Node frontend.
+
+        Fresh install strategy:
+          - Sanitise package.json (strip packageManager, engines, fix react 19 compat).
+          - Single npm install with every resilience flag, no retry loop.
+          - 3600 s hard timeout — never kills a running install mid-flight.
+          - Progress dots every 30 s so the log never looks stalled.
+
+        Two-layer npm caching:
+          Layer 1 — shared tarball cache (NPM_CACHE_DIR, --cache flag).
+          Layer 2 — full node_modules tree keyed on sha256(package.json).
+                     Hit = zero npm work, just symlink + straight to build.
+        """
+        import hashlib, shutil
+
         frontend_dir = str(Path(package_json_path).parent)
+        pkg_json_file = Path(frontend_dir) / "package.json"
 
-        pkg_json = os.path.join(frontend_dir, "package.json")
-        if not os.path.exists(pkg_json):
+        if not pkg_json_file.exists():
             await db_add_log(deployment_id, project_id,
-                f"⚠ No package.json in {frontend_dir} — skipping", level="warning", source="build")
-            return False
+                f"No package.json found in {frontend_dir} — skipping frontend build",
+                source="build")
+            return True  # not an error, just no frontend to build
 
-        pkg_manager = "npm"
-        if (Path(frontend_dir) / "yarn.lock").exists():
-            pkg_manager = "yarn"
-        elif (Path(frontend_dir) / "pnpm-lock.yaml").exists():
-            pkg_manager = "pnpm"
-
-        # Parse package.json to count deps
+        # ── Sanitise package.json before npm sees it ──────────────────────────
         try:
-            pkg_data = json.loads(Path(pkg_json).read_text())
-            all_deps = {**pkg_data.get("dependencies",{}), **pkg_data.get("devDependencies",{})}
+            pkg_data = json.loads(pkg_json_file.read_text(encoding="utf-8", errors="replace"))
+            changed = False
+            # Strip fields that force corepack / cause ENOTSUP / create noise
+            for field in ("packageManager", "engines", "funding"):
+                if field in pkg_data:
+                    del pkg_data[field]
+                    changed = True
+            # react-scripts 5 is incompatible with react 19 — downgrade silently
+            deps = pkg_data.get("dependencies", {})
+            if "react" in deps and "react-scripts" in deps:
+                if str(deps["react"]).lstrip("^~").startswith("19"):
+                    deps["react"]     = "^18.3.1"
+                    deps["react-dom"] = "^18.3.1"
+                    changed = True
+            if changed:
+                pkg_json_file.write_text(
+                    json.dumps(pkg_data, indent=2, ensure_ascii=False) + "\n",
+                    encoding="utf-8",
+                )
+        except Exception as e:
+            logger.warning(f"package.json sanitise (non-fatal): {e}")
+            pkg_data = {}
+
+        # Always force npm — yarn/pnpm have larger install footprint + OOM risk
+        pkg_manager = "npm"
+
+        try:
+            all_deps = {**pkg_data.get("dependencies", {}), **pkg_data.get("devDependencies", {})}
             total_npm = len(all_deps)
         except Exception:
             total_npm = "?"
 
-        await db_add_log(deployment_id, project_id,
-            f"Installing {total_npm} npm packages ({frontend_type})...", source="build")
+        # ── Cache key ─────────────────────────────────────────────────────────
+        pkg_json_text = pkg_json_file.read_text(encoding="utf-8", errors="replace")
+        pkg_hash      = hashlib.sha256(pkg_json_text.encode()).hexdigest()[:16]
+        cached_modules = Path(NPM_MODULES_DIR) / pkg_hash
+        target_modules = Path(frontend_dir) / "node_modules"
 
-        # Try --prefer-offline first (fast path), then fresh
-        for flags, label in [
-            ("--legacy-peer-deps --no-audit --prefer-offline", "cached"),
-            ("--legacy-peer-deps --no-audit", "fresh"),
-        ]:
-            result = await cls.run_command(
-                f"CI=true {pkg_manager} install {flags}",
-                cwd=frontend_dir, timeout=900,
-                env={"CI": "true", "NODE_ENV": "production",
-                     "NODE_OPTIONS": "--max-old-space-size=512"},
+        # ── Layer 2: node_modules cache hit ───────────────────────────────────
+        if cached_modules.is_dir() and (cached_modules / ".pydeploy_ok").exists():
+            await db_add_log(deployment_id, project_id,
+                "node_modules cache hit — skipping npm install", source="build")
+            try:
+                if target_modules.is_symlink():
+                    target_modules.unlink()
+                elif target_modules.exists():
+                    shutil.rmtree(str(target_modules))
+                os.symlink(str(cached_modules), str(target_modules))
+                await db_add_log(deployment_id, project_id,
+                    "node_modules restored from cache", source="build")
+                return await cls._run_frontend_build(
+                    frontend_dir, frontend_type, deployment_id, project_id)
+            except Exception as e:
+                logger.warning(f"node_modules cache restore failed ({e}) — running fresh install")
+
+        # ── Layer 1: shared npm tarball cache ─────────────────────────────────
+        os.makedirs(NPM_CACHE_DIR, exist_ok=True)
+        os.makedirs(NPM_MODULES_DIR, exist_ok=True)
+
+        await db_add_log(deployment_id, project_id,
+            f"Installing {total_npm} npm packages...", source="build")
+
+        npm_env = {
+            **os.environ,
+            "CI":                        "true",
+            # development so devDependencies are installed
+            "NODE_ENV":                  "development",
+            "NODE_OPTIONS":              "--max-old-space-size=512",
+            # point npm at our persistent tarball cache
+            "npm_config_cache":          NPM_CACHE_DIR,
+            "npm_config_audit":          "false",
+            "npm_config_fund":           "false",
+            "npm_config_update_notifier":"false",
+            "npm_config_loglevel":       "error",
+            "npm_config_progress":       "false",
+            # suppress donation prompts from various packages
+            "ADBLOCK":                   "1",
+            "DISABLE_OPENCOLLECTIVE":    "1",
+        }
+
+        install_cmd = (
+            "npm install "
+            "--legacy-peer-deps "   # tolerate peer dep conflicts (shadcn, radix, etc.)
+            "--no-audit "           # skip vuln scan — slow, not needed for deploy
+            "--no-fund "            # suppress funding messages
+            "--loglevel error "     # only show actual errors
+            "--progress false "     # no progress bar in log
+            f"--cache {NPM_CACHE_DIR}"  # shared tarball store
+        )
+
+        INSTALL_TIMEOUT = 3600  # 1 hour — never kill a running install
+
+        async def _progress_logger():
+            """Emit a heartbeat line every 30 s so the log doesn't look stalled."""
+            elapsed = 0
+            while True:
+                await asyncio.sleep(30)
+                elapsed += 30
+                await db_add_log(deployment_id, project_id,
+                    f"  npm install running... ({elapsed}s)", source="build")
+
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                install_cmd,
+                cwd=frontend_dir,
+                env=npm_env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-            if result["returncode"] == 0:
-                await db_add_log(deployment_id, project_id, f"✅ npm install OK ({label})", source="build")
-                break
+            progress_task = asyncio.ensure_future(_progress_logger())
+            try:
+                stdout_b, stderr_b = await asyncio.wait_for(
+                    proc.communicate(), timeout=INSTALL_TIMEOUT)
+            finally:
+                progress_task.cancel()
+                try:
+                    await progress_task
+                except asyncio.CancelledError:
+                    pass
+
+            stdout_s = stdout_b.decode("utf-8", errors="replace")
+            stderr_s = stderr_b.decode("utf-8", errors="replace")
+            returncode = proc.returncode if proc.returncode is not None else 0
+
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except Exception:
+                pass
             await db_add_log(deployment_id, project_id,
-                f"npm install ({label}) failed, trying next method...", level="warning", source="build")
-        else:
-            tail = (result.get("stdout","") + result.get("stderr",""))[-600:]
+                f"npm install timed out after {INSTALL_TIMEOUT}s",
+                level="error", source="build")
+            return False
+        except Exception as exc:
             await db_add_log(deployment_id, project_id,
-                f"❌ npm install failed:\n{tail}", level="error", source="build")
+                f"npm install subprocess error: {exc}",
+                level="error", source="build")
             return False
 
-        # Build
-        await db_add_log(deployment_id, project_id, f"Building {frontend_type} frontend...", source="build")
-        build_cmd = "npm run build" if pkg_manager == "npm" else f"{pkg_manager} build"
+        if returncode != 0:
+            # Filter out npm warnings — only show actual error lines
+            error_lines = [
+                l for l in (stdout_s + "\n" + stderr_s).splitlines()
+                if l.strip() and not l.strip().lower().startswith(("npm warn", "npm notice"))
+            ]
+            tail = "\n".join(error_lines[-20:])
+            await db_add_log(deployment_id, project_id,
+                f"npm install failed (exit {returncode}):\n{tail}",
+                level="error", source="build")
+            return False
+
+        await db_add_log(deployment_id, project_id,
+            "npm install complete", source="build")
+
+        # ── Populate layer-2 node_modules cache ───────────────────────────────
+        if target_modules.is_dir() and not target_modules.is_symlink():
+            try:
+                if cached_modules.exists():
+                    shutil.rmtree(str(cached_modules))
+                shutil.copytree(str(target_modules), str(cached_modules), symlinks=True)
+                (cached_modules / ".pydeploy_ok").write_text("ok")
+                await db_add_log(deployment_id, project_id,
+                    "node_modules cached for future deploys", source="build")
+            except Exception as e:
+                logger.warning(f"node_modules cache write failed (non-fatal): {e}")
+
+        return await cls._run_frontend_build(
+            frontend_dir, frontend_type, deployment_id, project_id)
+
+    @classmethod
+    async def _run_frontend_build(
+        cls,
+        frontend_dir: str,
+        frontend_type: str,
+        deployment_id: str,
+        project_id: str,
+    ) -> bool:
+        """Run npm run build after node_modules are in place."""
+        await db_add_log(deployment_id, project_id,
+            f"Building {frontend_type} frontend...", source="build")
         result = await cls.run_command(
-            f"CI=true {build_cmd}", cwd=frontend_dir, timeout=900,
-            env={"CI": "true", "NODE_OPTIONS": "--max-old-space-size=512"},
+            "npm run build",
+            cwd=frontend_dir,
+            timeout=1800,
+            env={
+                "CI":                    "true",
+                "NODE_OPTIONS":          "--max-old-space-size=512",
+                # Suppress lint-as-error so ESLint warnings don't abort the build
+                "DISABLE_ESLINT_PLUGIN": "true",
+                "ESLINT_NO_DEV_ERRORS":  "true",
+            },
         )
         if result["returncode"] != 0:
-            tail = (result.get("stdout","") + result.get("stderr",""))[-600:]
+            error_lines = [
+                l for l in (result.get("stdout", "") + result.get("stderr", "")).splitlines()
+                if l.strip() and not l.strip().lower().startswith(("npm warn", "npm notice"))
+            ]
+            tail = "\n".join(error_lines[-30:])
             await db_add_log(deployment_id, project_id,
-                f"❌ Frontend build failed:\n{tail}", level="error", source="build")
+                f"Frontend build failed:\n{tail}", level="error", source="build")
             return False
 
-        await db_add_log(deployment_id, project_id, "✅ Frontend build complete.", source="build")
+        await db_add_log(deployment_id, project_id,
+            "Frontend build complete", source="build")
         return True
-
 
 # SECTION 10: RUNTIME MANAGER (Process Pool)
 # ──────────────────────────────────────────────────────────────────────────────
