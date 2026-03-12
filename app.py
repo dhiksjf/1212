@@ -88,13 +88,13 @@ STORAGE_BUCKET: str = os.environ.get("STORAGE_BUCKET", "pydeploy-projects")
 PLATFORM_TITLE: str = "PyDeploy"
 
 # ── AI Agent config ────────────────────────────────────────────────────────
-# Primary: Google Gemini API (gemini-3.1-pro-preview-customtools)
-#   → purpose-built for agentic workflows with custom tools
+# Primary: Google Gemini API (gemini-3.1-pro-preview)
+#   → strong reasoning + function calling for agentic workflows
 # Fallback: OpenRouter free models
 GEMINI_API_KEY: str = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_BASE: str = "https://generativelanguage.googleapis.com/v1beta/models"
-GEMINI_PRIMARY: str = "gemini-3.1-pro-preview-customtools"  # best for custom tool agents
-GEMINI_FALLBACK: str = "gemini-3.1-pro-preview"             # same model, general endpoint
+GEMINI_PRIMARY: str = "gemini-3.1-pro-preview"   # latest Gemini 3.1 Pro, function calling
+GEMINI_FALLBACK: str = "gemini-2.5-flash"        # stable, widely available, reliable fallback
 
 # OpenRouter fallbacks (used if Gemini fails)
 OPENROUTER_API_KEY: str = os.environ.get("OPENROUTER_API_KEY", "")
@@ -1268,7 +1268,8 @@ class BuildSystem:
             result = await cls.run_command(
                 f"CI=true {pkg_manager} install {flags}",
                 cwd=frontend_dir, timeout=900,
-                env={"CI": "true", "NODE_ENV": "production"},
+                env={"CI": "true", "NODE_ENV": "production",
+                     "NODE_OPTIONS": "--max-old-space-size=512"},
             )
             if result["returncode"] == 0:
                 await db_add_log(deployment_id, project_id, f"✅ npm install OK ({label})", source="build")
@@ -1286,7 +1287,7 @@ class BuildSystem:
         build_cmd = "npm run build" if pkg_manager == "npm" else f"{pkg_manager} build"
         result = await cls.run_command(
             f"CI=true {build_cmd}", cwd=frontend_dir, timeout=900,
-            env={"CI": "true"},
+            env={"CI": "true", "NODE_OPTIONS": "--max-old-space-size=512"},
         )
         if result["returncode"] != 0:
             tail = (result.get("stdout","") + result.get("stderr",""))[-600:]
@@ -2028,11 +2029,10 @@ async def restart_deployment(project_id: str, deployment_id: str) -> bool:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# SECTION 11.5: AI ULTRA AGENT  ─ gemini-3.1-pro-preview-customtools
+# SECTION 11.5: AI ULTRA AGENT  ─ gemini-3.1-pro-preview / gemini-2.5-flash
 # ──────────────────────────────────────────────────────────────────────────────
-# Primary:  Google Gemini API  (gemini-3.1-pro-preview-customtools)
-#           purpose-built for agentic workflows with custom tools
-# Fallback: gemini-3.1-pro-preview  →  OpenRouter models
+# Primary:  Google Gemini API  (gemini-3.1-pro-preview)
+# Fallback: gemini-2.5-flash  →  OpenRouter models
 #
 # Features:
 #  • Never stops — retries with exponential backoff, falls through all models
@@ -2277,7 +2277,7 @@ async def _ai_call(
     async def _log(msg: str, level: str = "info"):
         await db_add_log(deployment_id, project_id, msg, level=level, source="ai")
 
-    # 1. Gemini primary (customtools endpoint — best for our use case)
+    # 1. Gemini primary (gemini-3.1-pro-preview — strong reasoning + tool use)
     if GEMINI_API_KEY:
         await _log(f"[{_ts()}] 🧠 Trying {GEMINI_PRIMARY}…")
         result = await _call_gemini(GEMINI_PRIMARY, messages, tools)
